@@ -4,6 +4,7 @@ from typing import Any, Protocol
 
 from vntdr.models import MonitorResult, OrderInstruction
 from vntdr.services.research import ResearchService
+from vntdr.services.risk import RiskManager
 from vntdr.storage.repositories import MarketDataRepository
 
 
@@ -30,12 +31,14 @@ class MonitoringService:
         notifier: Notifier,
         order_executor: OrderExecutor,
         signal_store: SignalStore,
+        risk_manager: RiskManager,
     ) -> None:
         self.research_service = research_service
         self.market_data_repository = market_data_repository
         self.notifier = notifier
         self.order_executor = order_executor
         self.signal_store = signal_store
+        self.risk_manager = risk_manager
 
     def monitor_once(
         self,
@@ -67,9 +70,14 @@ class MonitoringService:
             bars=bars,
             parameters=best_parameters,
         )
+        self.risk_manager.validate_symbol(symbol)
         cache_key = f"signal:{symbol}:{interval}:{strategy_name}"
         previous_signal = self.signal_store.get(cache_key)
-        instructions = self._build_instructions(symbol, previous_signal, signal, volume)
+        instructions = self.risk_manager.filter_instructions(
+            self._build_instructions(symbol, previous_signal, signal, volume),
+            previous_signal=previous_signal,
+            next_signal=signal,
+        )
         if previous_signal != signal:
             message = self._build_message(
                 symbol=symbol,

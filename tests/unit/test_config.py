@@ -19,6 +19,7 @@ def test_settings_load_nested_models(monkeypatch: pytest.MonkeyPatch, env_map: d
     settings = Settings.from_env()
 
     assert settings.okx.api_key.get_secret_value() == "key"
+    assert settings.okx.trading_enabled is True
     assert settings.database.username == "tester"
     assert settings.redis.host == "localhost"
     assert settings.telegram.chat_id == "chat"

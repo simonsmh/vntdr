@@ -17,6 +17,12 @@ class OkxSettings(BaseModel):
     passphrase: SecretStr | None = None
     rest_base_url: str = "https://www.okx.com"
     demo_trading: bool = False
+    margin_mode: str = "cross"
+    order_type: str = "market"
+
+    @property
+    def trading_enabled(self) -> bool:
+        return bool(self.api_key and self.secret_key and self.passphrase)
 
 
 class DatabaseSettings(BaseModel):
@@ -71,6 +77,9 @@ class RiskSettings(BaseModel):
     max_strategy_capital: float = Field(default=0.30, ge=0.0, le=1.0)
     max_total_exposure: float = Field(default=0.60, ge=0.0, le=1.0)
     max_drawdown: float = Field(default=0.02, ge=0.0, le=1.0)
+    allowed_symbols: list[str] = Field(default_factory=lambda: ["XAUUSDT"])
+    max_order_size: float = Field(default=1.0, gt=0.0)
+    allow_opening_trades: bool = True
 
 
 class Settings(BaseModel):
@@ -102,6 +111,8 @@ class Settings(BaseModel):
                 passphrase=_secret(mapping.get("OKX_PASSPHRASE")),
                 rest_base_url=mapping.get("OKX_REST_BASE_URL", "https://www.okx.com"),
                 demo_trading=_to_bool(mapping.get("OKX_DEMO_TRADING", "false")),
+                margin_mode=mapping.get("OKX_MARGIN_MODE", "cross"),
+                order_type=mapping.get("OKX_ORDER_TYPE", "market"),
             ),
             database=DatabaseSettings(
                 host=mapping.get("PG_HOST", "localhost"),
@@ -135,6 +146,13 @@ class Settings(BaseModel):
                 max_strategy_capital=float(mapping.get("VNTDR_MAX_STRATEGY_CAPITAL", "0.30")),
                 max_total_exposure=float(mapping.get("VNTDR_MAX_TOTAL_EXPOSURE", "0.60")),
                 max_drawdown=float(mapping.get("VNTDR_MAX_DRAWDOWN", "0.02")),
+                allowed_symbols=[
+                    symbol.strip()
+                    for symbol in mapping.get("VNTDR_ALLOWED_SYMBOLS", "XAUUSDT").split(",")
+                    if symbol.strip()
+                ],
+                max_order_size=float(mapping.get("VNTDR_MAX_ORDER_SIZE", "1.0")),
+                allow_opening_trades=_to_bool(mapping.get("VNTDR_ALLOW_OPENING_TRADES", "true")),
             ),
         )
 

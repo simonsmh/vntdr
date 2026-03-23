@@ -9,13 +9,15 @@ import redis
 import typer
 
 from vntdr.config import Settings
-from vntdr.adapters.orders import SimulatedOrderExecutor
+from vntdr.adapters.orders import OkxOrderExecutor, SimulatedOrderExecutor
 from vntdr.adapters.state import RedisSignalStore
 from vntdr.adapters.telegram import TelegramNotifier
 from vntdr.models import HealthCheckResult, MonitorResult, ResearchJobConfig, SyncResult
 from vntdr.services.history import HistorySyncService, OkxHistoryClient
 from vntdr.services.monitoring import MonitoringService
 from vntdr.services.research import ResearchService
+from vntdr.services.risk import RiskManager
+from vntdr.services.telegram_research import TelegramResearchService
 from vntdr.storage.database import Database
 from vntdr.storage.repositories import MarketDataRepository, ResearchRunRepository
 
@@ -51,8 +53,26 @@ class CommandContext:
                 bot_token=settings.telegram.bot_token.get_secret_value() if settings.telegram.bot_token else "",
                 chat_id=settings.telegram.chat_id or "",
             ),
-            order_executor=SimulatedOrderExecutor(),
+            order_executor=self._build_order_executor(settings),
             signal_store=RedisSignalStore(redis_client),
+            risk_manager=RiskManager(settings.risk),
+        )
+        self.telegram_research_service = TelegramResearchService(
+            settings=settings,
+            history_service=self.history_service,
+            research_service=self.research_service,
+        )
+
+    def _build_order_executor(self, settings: Settings):
+        if not settings.okx.trading_enabled:
+            return SimulatedOrderExecutor()
+        return OkxOrderExecutor(
+            api_key=settings.okx.api_key.get_secret_value() if settings.okx.api_key else "",
+            secret_key=settings.okx.secret_key.get_secret_value() if settings.okx.secret_key else "",
+            passphrase=settings.okx.passphrase.get_secret_value() if settings.okx.passphrase else "",
+            demo_trading=settings.okx.demo_trading,
+            margin_mode=settings.okx.margin_mode,
+            order_type=settings.okx.order_type,
         )
 
     def doctor(self) -> HealthCheckResult:
@@ -94,6 +114,9 @@ class CommandContext:
 
     def walk_forward(self, config: ResearchJobConfig):
         return self.research_service.walk_forward(config)
+
+    def telegram_research(self) -> TelegramResearchService:
+        return self.telegram_research_service
 
     def monitor_once(
         self,
@@ -320,3 +343,19 @@ def live_command(
     while True:
         time.sleep(heartbeat_interval)
         run_monitor_once()
+
+
+@app.command("telegram-bot")
+def telegram_bot_command() -> None:
+    settings = Settings.from_env()
+    settings.validate_for("live")
+    context = create_command_context(settings)
+    from vntdr.adapters.telegram_bot import TelegramCommandBot
+
+    bot = TelegramCommandBot(
+        bot_token=settings.telegram.bot_token.get_secret_value() if settings.telegram.bot_token else "",
+        chat_id=settings.telegram.chat_id or "",
+        research_service=context.telegram_research(),
+        monitor_once_callback=context.monitor_once,
+    )
+    bot.run()

@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from vntdr.config import Settings
 from vntdr.services.monitoring import MonitoringService
 from vntdr.services.research import ResearchService
+from vntdr.services.risk import RiskManager
 from vntdr.storage.database import Database
 from vntdr.storage.repositories import MarketDataRepository, ResearchRunRepository
 
@@ -71,6 +72,7 @@ def test_monitoring_reverses_from_long_to_short_and_notifies(
         notifier=notifier,
         order_executor=executor,
         signal_store=state_store,
+        risk_manager=RiskManager(settings.risk),
     )
 
     result = service.monitor_once(
