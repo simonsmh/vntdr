@@ -18,7 +18,6 @@ RUN uv sync --frozen --extra veighna --group dev --no-install-project \
     || uv sync --extra veighna --group dev --no-install-project
 
 COPY src ./src
-COPY .env.example ./
 
 RUN uv sync --frozen --extra veighna --group dev || uv sync --extra veighna --group dev
 
