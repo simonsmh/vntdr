@@ -1,13 +1,13 @@
 services:
   db:
-    image: postgres:16-alpine
+    image: postgres:18
     restart: always
     environment:
       POSTGRES_USER: ${PG_USER}
       POSTGRES_PASSWORD: ${PG_PASSWORD}
       POSTGRES_DB: ${PG_DB_NAME}
     volumes:
-      - pg_data:/var/lib/postgresql/data
+      - pg_data:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${PG_USER} -d ${PG_DB_NAME}"]
       interval: 10s
@@ -17,7 +17,7 @@ services:
       - quant_net
 
   cache:
-    image: redis:7-alpine
+    image: redis:latest
     restart: always
     environment:
       REDIS_APPENDONLY: ${REDIS_APPENDONLY:-yes}
@@ -38,9 +38,7 @@ services:
       - quant_net
 
   quant_core:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: ghcr.io/simonsmh/vntdr:latest
     restart: always
     env_file:
       - .env
