@@ -7,7 +7,7 @@ services:
       POSTGRES_PASSWORD: ${PG_PASSWORD}
       POSTGRES_DB: ${PG_DB_NAME}
     volumes:
-      - ./data/pg_data:/var/lib/postgresql/data
+      - pg_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${PG_USER} -d ${PG_DB_NAME}"]
       interval: 10s
@@ -19,10 +19,16 @@ services:
   cache:
     image: redis:7-alpine
     restart: always
-    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+    environment:
+      REDIS_APPENDONLY: ${REDIS_APPENDONLY:-yes}
+      REDIS_SAVE: ${REDIS_SAVE:-60 1000}
+      REDIS_MAXMEMORY_POLICY: ${REDIS_MAXMEMORY_POLICY:-allkeys-lru}
+    command:
+      - sh
+      - -c
+      - redis-server --appendonly "$$REDIS_APPENDONLY" --save "$$REDIS_SAVE" --maxmemory-policy "$$REDIS_MAXMEMORY_POLICY"
     volumes:
-      - ./data/redis_data:/data
-      - ./docker/redis.conf:/usr/local/etc/redis/redis.conf:ro
+      - redis_data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -44,9 +50,8 @@ services:
       cache:
         condition: service_healthy
     volumes:
-      - ./.vntrader:/app/.vntrader
-      - ./reports:/app/reports
-      - /etc/localtime:/etc/localtime:ro
+      - vntrader_data:/app/.vntrader
+      - reports_data:/app/reports
     command: ["vntdr", "live"]
     healthcheck:
       test: ["CMD", "vntdr", "doctor"]
@@ -59,3 +64,9 @@ services:
 networks:
   quant_net:
     driver: bridge
+
+volumes:
+  pg_data:
+  redis_data:
+  vntrader_data:
+  reports_data:

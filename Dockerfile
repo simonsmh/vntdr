@@ -13,12 +13,15 @@ RUN apt-get update \
 
 RUN pip install --no-cache-dir uv
 
-COPY pyproject.toml README.md .python-version ./
-RUN uv sync --frozen --extra veighna --group dev || uv sync --extra veighna --group dev
+COPY pyproject.toml uv.lock README.md .python-version ./
+RUN uv sync --frozen --extra veighna --group dev --no-install-project \
+    || uv sync --extra veighna --group dev --no-install-project
 
 COPY src ./src
 COPY docker ./docker
 COPY .env.example ./
+
+RUN uv sync --frozen --extra veighna --group dev || uv sync --extra veighna --group dev
 
 RUN mkdir -p /app/reports /app/.vntrader
 
