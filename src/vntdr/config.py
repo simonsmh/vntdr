@@ -19,6 +19,8 @@ class OkxSettings(BaseModel):
     demo_trading: bool = False
     margin_mode: str = "cross"
     order_type: str = "market"
+    order_retry_count: int = 3  # 下单遇瞬时错误(如 50013 系统繁忙)的重试次数
+    order_retry_wait_seconds: float = 1.0  # 重试基础等待秒数(指数退避)
 
     @property
     def trading_enabled(self) -> bool:
@@ -117,6 +119,8 @@ class Settings(BaseModel):
                 demo_trading=_to_bool(mapping.get("OKX_DEMO_TRADING", "false")),
                 margin_mode=mapping.get("OKX_MARGIN_MODE", "cross"),
                 order_type=mapping.get("OKX_ORDER_TYPE", "market"),
+                order_retry_count=int(mapping.get("OKX_ORDER_RETRY_COUNT", "3")),
+                order_retry_wait_seconds=float(mapping.get("OKX_ORDER_RETRY_WAIT", "1.0")),
             ),
             database=DatabaseSettings(
                 host=mapping.get("PG_HOST", "localhost"),
