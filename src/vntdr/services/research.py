@@ -5,9 +5,11 @@ import itertools
 import json
 import random
 from dataclasses import dataclass
-from math import sqrt
-from statistics import mean, pstdev
+import math
+from statistics import mean, pstdev, stdev
 from typing import Any
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 
 from vntdr.config import Settings
 from vntdr.models import BarRecord, FoldResult, ResearchJobConfig, ResearchReport, aggregate_metrics
@@ -33,12 +35,20 @@ class ResearchService:
         self.market_data_repository = market_data_repository
         self.research_run_repository = research_run_repository
         self.settings.research.report_dir.mkdir(parents=True, exist_ok=True)
+        self._executor = ThreadPoolExecutor(max_workers=4)
 
     def backtest(self, config: ResearchJobConfig) -> ResearchReport:
         bars = self._load_bars(config)
         report = self._build_report(config, bars, parameters=config.parameters)
         self._persist_report(report, config)
         return report
+
+    async def backtest_async(self, config: ResearchJobConfig) -> ResearchReport:
+        return await asyncio.get_event_loop().run_in_executor(
+            self._executor,
+            self.backtest,
+            config
+        )
 
     def optimize(self, config: ResearchJobConfig, method: str = "grid") -> ResearchReport:
         bars = self._load_bars(config)
@@ -67,6 +77,14 @@ class ResearchService:
         )
         self._persist_report(report, config.model_copy(update={"mode": "optimize"}))
         return report
+
+    async def optimize_async(self, config: ResearchJobConfig, method: str = "grid") -> ResearchReport:
+        return await asyncio.get_event_loop().run_in_executor(
+            self._executor,
+            self.optimize,
+            config,
+            method
+        )
 
     def walk_forward(self, config: ResearchJobConfig) -> ResearchReport:
         bars = self._load_bars(config)
@@ -129,6 +147,13 @@ class ResearchService:
             run_id=run_id,
         )
         return report
+
+    async def walk_forward_async(self, config: ResearchJobConfig) -> ResearchReport:
+        return await asyncio.get_event_loop().run_in_executor(
+            self._executor,
+            self.walk_forward,
+            config
+        )
 
     def _build_report(
         self,
@@ -212,6 +237,23 @@ class ResearchService:
         best_parameters, best_metrics = evaluations[0]
         return best_parameters, best_metrics, evaluations
 
+    async def optimize_parameters_async(
+        self,
+        *,
+        strategy_name: str,
+        bars: list[BarRecord],
+        parameter_space: dict[str, list[Any]],
+        method: str = "grid",
+    ) -> tuple[dict[str, Any], dict[str, float], list[tuple[dict[str, Any], dict[str, float]]]]:
+        return await asyncio.get_event_loop().run_in_executor(
+            self._executor,
+            self.optimize_parameters,
+            strategy_name,
+            bars,
+            parameter_space,
+            method
+        )
+
     def latest_signal(
         self,
         *,
@@ -223,6 +265,21 @@ class ResearchService:
         if not bars:
             return 0
         return int(strategy.signal_for_index(bars, len(bars) - 1, parameters))
+
+    async def latest_signal_async(
+        self,
+        *,
+        strategy_name: str,
+        bars: list[BarRecord],
+        parameters: dict[str, Any],
+    ) -> int:
+        return await asyncio.get_event_loop().run_in_executor(
+            self._executor,
+            self.latest_signal,
+            strategy_name,
+            bars,
+            parameters
+        )
 
     def _evaluate_parameter_space(
         self,
@@ -252,13 +309,18 @@ class ResearchService:
         parameter_space: dict[str, list[Any]],
     ) -> list[tuple[dict[str, Any], dict[str, float]]]:
         keys = list(parameter_space.keys())
-        combos = itertools.product(*(parameter_space[key] for key in keys))
+        combos = list(itertools.product(*(parameter_space[key] for key in keys)))
         evaluations = []
         for combo in combos:
             parameters = dict(zip(keys, combo, strict=True))
             outcome = self._execute_backtest(bars, strategy_name, parameters)
             evaluations.append((parameters, outcome.metrics))
-        return sorted(evaluations, key=lambda item: item[1]["sharpe_ratio"], reverse=True)
+        # Sort by sharpe_ratio primarily, then total_return
+        return sorted(
+            evaluations,
+            key=lambda item: (item[1].get("sharpe_ratio", 0.0), item[1].get("total_return", 0.0)),
+            reverse=True
+        )
 
     def _run_genetic_search(
         self,
@@ -280,7 +342,11 @@ class ResearchService:
                     outcome = self._execute_backtest(bars, strategy_name, parameters)
                     evaluations[signature] = (parameters.copy(), outcome.metrics)
                 scored.append(evaluations[signature])
-            scored.sort(key=lambda item: item[1]["sharpe_ratio"], reverse=True)
+            # Sort by sharpe_ratio primarily, then total_return
+            scored.sort(
+                key=lambda item: (item[1].get("sharpe_ratio", 0.0), item[1].get("total_return", 0.0)),
+                reverse=True
+            )
             parents = [parameters for parameters, _ in scored[:2]]
             next_population = parents.copy()
             while len(next_population) < len(population):
@@ -292,7 +358,11 @@ class ResearchService:
                 }
                 next_population.append(child)
             population = next_population
-        return sorted(evaluations.values(), key=lambda item: item[1]["sharpe_ratio"], reverse=True)
+        return sorted(
+            evaluations.values(),
+            key=lambda item: (item[1].get("sharpe_ratio", 0.0), item[1].get("total_return", 0.0)),
+            reverse=True
+        )
 
     def _execute_backtest(
         self,
@@ -300,24 +370,55 @@ class ResearchService:
         strategy_name: str,
         parameters: dict[str, Any],
     ) -> BacktestOutcome:
+        if not bars:
+            return BacktestOutcome(metrics={}, equity_curve=[], signals=[])
+
         strategy = self._load_strategy(strategy_name)
         position = 0
         trade_count = 0
         equity = [1.0]
         step_returns: list[float] = []
         signals: list[int] = []
-        for index in range(1, len(bars)):
-            signal = strategy.signal_for_index(bars, index, parameters)
+        
+        # Get fee rate from settings
+        fee_rate = (
+            self.settings.research.maker_fee_rate
+            if self.settings.research.use_maker_fee
+            else self.settings.research.taker_fee_rate
+        )
+        
+        # Backtest loop: 
+        # 1. Calculate signal at end of bar 'index' (using data up to 'index')
+        # 2. Execute trade at close price of bar 'index' (paying fees)
+        # 3. Earn/lose return from bar 'index' to bar 'index + 1'
+        for index in range(len(bars) - 1):
+            signal = int(strategy.signal_for_index(bars, index, parameters))
             signals.append(signal)
+            
             if signal != position:
-                trade_count += 1
+                if position != 0:
+                    equity[-1] *= (1 - fee_rate)
+                    trade_count += 1
+                
+                if signal != 0:
+                    equity[-1] *= (1 - fee_rate)
+                    trade_count += 1
+
                 position = signal
-            price_return = (bars[index].close / bars[index - 1].close) - 1
+
+            # PnL is realized from bar 'index' to 'index + 1'
+            price_return = (bars[index + 1].close / bars[index].close) - 1
             pnl = price_return * position
             step_returns.append(pnl)
             equity.append(equity[-1] * (1 + pnl))
+            
+        # Close final position if any to account for exit fees
+        if position != 0:
+            equity[-1] *= (1 - fee_rate)
+            trade_count += 1
 
-        metrics = self._metrics_from_returns(step_returns, equity, trade_count)
+        interval = bars[0].interval
+        metrics = self._metrics_from_returns(step_returns, equity, trade_count, interval)
         return BacktestOutcome(metrics=metrics, equity_curve=equity, signals=signals)
 
     def _load_strategy(self, strategy_name: str) -> Any:
@@ -338,6 +439,7 @@ class ResearchService:
         returns: list[float],
         equity_curve: list[float],
         trade_count: int,
+        interval: str = "1h",
     ) -> dict[str, float]:
         if not returns:
             return {
@@ -345,18 +447,49 @@ class ResearchService:
                 "sharpe_ratio": 0.0,
                 "max_drawdown": 0.0,
                 "trade_count": float(trade_count),
+                "win_rate": 0.0,
+                "profit_factor": 0.0,
             }
+            
         avg_return = mean(returns)
-        volatility = pstdev(returns)
-        sharpe = (avg_return / volatility * (len(returns) ** 0.5)) if volatility else 0.0
+        # Use sample standard deviation (stdev) instead of population (pstdev)
+        volatility = stdev(returns) if len(returns) > 1 else 0.0
+        
+        # Annualization factors based on interval
+        periods_map = {
+            "1m": 525600, "3m": 175200, "5m": 105120, "15m": 35040, 
+            "30m": 17520, "1h": 8760, "2h": 4380, "4h": 2190, 
+            "6h": 1460, "12h": 730, "1d": 365
+        }
+        periods_per_year = periods_map.get(interval.lower(), 8760)
+        
+        if volatility > 0:
+            # Annualized Sharpe Ratio = (Mean / Std) * sqrt(PeriodsPerYear)
+            sharpe = (avg_return / volatility) * math.sqrt(periods_per_year)
+        else:
+            sharpe = 0.0
+            
+        pos_returns = [r for r in returns if r > 0]
+        neg_returns = [r for r in returns if r < 0]
+        win_rate = len(pos_returns) / (len(pos_returns) + len(neg_returns)) if (len(pos_returns) + len(neg_returns)) > 0 else 0.0
+        
+        sum_pos = sum(pos_returns)
+        sum_neg = abs(sum(neg_returns))
+        profit_factor = sum_pos / sum_neg if sum_neg > 0 else (99.9 if sum_pos > 0 else 0.0)
+
         peak = equity_curve[0]
         max_drawdown = 0.0
         for value in equity_curve:
             peak = max(peak, value)
-            max_drawdown = min(max_drawdown, (value / peak) - 1)
+            dd = (value / peak) - 1
+            if dd < max_drawdown:
+                max_drawdown = dd
+                
         return {
-            "total_return": equity_curve[-1] - 1,
-            "sharpe_ratio": sharpe,
-            "max_drawdown": max_drawdown,
+            "total_return": round(equity_curve[-1] - 1, 6),
+            "sharpe_ratio": round(sharpe, 4),
+            "max_drawdown": round(max_drawdown, 4),
             "trade_count": float(trade_count),
+            "win_rate": round(win_rate, 4),
+            "profit_factor": round(profit_factor, 4),
         }

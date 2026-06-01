@@ -1,5 +1,8 @@
-"""vntdr package."""
+import logging
 
-__all__ = ["__version__"]
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
 
-__version__ = "0.1.0"
+logger = logging.getLogger(__name__)

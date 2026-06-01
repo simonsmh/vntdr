@@ -10,11 +10,35 @@ from vntdr.models import HealthCheckResult, MonitorResult, SyncResult
 runner = CliRunner()
 
 
+class FakeSignalStore:
+    def get(self, key: str) -> int | None:
+        return None
+    
+    def set(self, key: str, value: int) -> None:
+        pass
+
+
+class FakeMonitoringService:
+    def __init__(self, monitor_result: MonitorResult) -> None:
+        self.monitor_result = monitor_result
+        self.signal_store = FakeSignalStore()
+    
+    def reconcile_positions(self, symbol: str) -> int | None:
+        return 0
+    
+    def monitor_once(self, **_: object) -> MonitorResult:
+        return self.monitor_result
+
+
 @dataclass
 class FakeContext:
     health_result: HealthCheckResult
     sync_result: SyncResult
     monitor_result: MonitorResult | None = None
+
+    def __post_init__(self) -> None:
+        if self.monitor_result is not None:
+            self.monitoring_service = FakeMonitoringService(self.monitor_result)
 
     def doctor(self) -> HealthCheckResult:
         return self.health_result

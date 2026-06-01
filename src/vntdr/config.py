@@ -67,17 +67,21 @@ class ResearchSettings(BaseModel):
     sync_batch_limit: int = 100
     default_warmup_days: int = 10
     default_strategy: str = "cm_macd_ult_mtf"
-    default_symbol: str = "XAUUSDT"
-    default_interval: str = "4h"
+    default_symbol: str = "XAU-USDT-SWAP"
+    default_interval: str = "4H"
     monitor_lookback_bars: int = 120
     default_order_size: float = 1.0
+    default_rank_lookback_hours: int = 24  # 回测默认回看小时数
+    maker_fee_rate: float = 0.0002  # Maker 手续费率，默认 0.02%
+    taker_fee_rate: float = 0.0005  # Taker 手续费率，默认 0.05%
+    use_maker_fee: bool = False  # 是否使用 maker 费率（默认使用 taker）
 
 
 class RiskSettings(BaseModel):
     max_strategy_capital: float = Field(default=0.30, ge=0.0, le=1.0)
     max_total_exposure: float = Field(default=0.60, ge=0.0, le=1.0)
     max_drawdown: float = Field(default=0.02, ge=0.0, le=1.0)
-    allowed_symbols: list[str] = Field(default_factory=lambda: ["XAUUSDT"])
+    allowed_symbols: list[str] = Field(default_factory=lambda: ["XAU-USDT-SWAP"])
     max_order_size: float = Field(default=1.0, gt=0.0)
     allow_opening_trades: bool = True
 
@@ -137,10 +141,13 @@ class Settings(BaseModel):
                 sync_batch_limit=int(mapping.get("VNTDR_SYNC_BATCH_LIMIT", "100")),
                 default_warmup_days=int(mapping.get("VNTDR_DEFAULT_WARMUP_DAYS", "10")),
                 default_strategy=mapping.get("VNTDR_DEFAULT_STRATEGY", "cm_macd_ult_mtf"),
-                default_symbol=mapping.get("VNTDR_DEFAULT_SYMBOL", "XAUUSDT"),
-                default_interval=mapping.get("VNTDR_DEFAULT_INTERVAL", "4h"),
+                default_symbol=mapping.get("VNTDR_DEFAULT_SYMBOL", "XAU-USDT-SWAP"),
+                default_interval=mapping.get("VNTDR_DEFAULT_INTERVAL", "4H"),
                 monitor_lookback_bars=int(mapping.get("VNTDR_MONITOR_LOOKBACK_BARS", "120")),
                 default_order_size=float(mapping.get("VNTDR_DEFAULT_ORDER_SIZE", "1.0")),
+                maker_fee_rate=float(mapping.get("VNTDR_MAKER_FEE_RATE", "0.0002")),
+                taker_fee_rate=float(mapping.get("VNTDR_TAKER_FEE_RATE", "0.0005")),
+                use_maker_fee=_to_bool(mapping.get("VNTDR_USE_MAKER_FEE", "false")),
             ),
             risk=RiskSettings(
                 max_strategy_capital=float(mapping.get("VNTDR_MAX_STRATEGY_CAPITAL", "0.30")),
@@ -148,7 +155,7 @@ class Settings(BaseModel):
                 max_drawdown=float(mapping.get("VNTDR_MAX_DRAWDOWN", "0.02")),
                 allowed_symbols=[
                     symbol.strip()
-                    for symbol in mapping.get("VNTDR_ALLOWED_SYMBOLS", "XAUUSDT").split(",")
+                    for symbol in mapping.get("VNTDR_ALLOWED_SYMBOLS", "XAU-USDT-SWAP").split(",")
                     if symbol.strip()
                 ],
                 max_order_size=float(mapping.get("VNTDR_MAX_ORDER_SIZE", "1.0")),

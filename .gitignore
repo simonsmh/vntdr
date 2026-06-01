@@ -9,3 +9,4 @@ reports/
 .vntrader/
 htmlcov/
 coverage.xml
+.vntdr/

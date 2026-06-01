@@ -68,6 +68,7 @@ class MonitorResult(BaseModel):
     best_parameters: dict[str, Any] = Field(default_factory=dict)
     actions: list[str] = Field(default_factory=list)
     notification_sent: bool = False
+    error: str | None = None
 
 
 class HealthCheckResult(BaseModel):

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Any, Protocol
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 
 import okx.MarketData as MarketData
 from tenacity import Retrying, stop_after_attempt, wait_fixed
@@ -37,6 +39,7 @@ class OkxHistoryClient:
             flag="1" if demo_trading else "0",
             domain=self.base_url,
         )
+        self._executor = ThreadPoolExecutor(max_workers=4)
 
     def fetch_candles(
         self,
@@ -46,22 +49,33 @@ class OkxHistoryClient:
         end: datetime,
         limit: int,
     ) -> list[dict[str, Any]]:
-        response = self.market_api.get_history_candlesticks(
+        all_rows: list[dict[str, Any]] = []
+        
+        # Use get_candlesticks instead of get_history_candlesticks
+        # It returns the latest candles directly
+        # OKX requires bar in uppercase for hours: 1h -> 1H, 4h -> 4H
+        okx_bar = interval.upper() if interval.endswith(('h', 'H')) else interval
+        response = self.market_api.get_candlesticks(
             instId=symbol,
-            before=str(int(end.astimezone(timezone.utc).timestamp() * 1000)),
-            bar=interval,
-            limit=str(limit),
+            bar=okx_bar,
+            limit=str(300),  # Get maximum possible in one request
         )
         if response.get("code") != "0":
             raise RuntimeError(f"OKX SDK error: {response}")
+        
         rows = response.get("data", [])
-        normalized: list[dict[str, Any]] = []
+        if not rows:
+            return all_rows
+            
         for row in rows:
             timestamp_ms, open_price, high_price, low_price, close_price, volume, *_ = row
             candle_time = datetime.fromtimestamp(int(timestamp_ms) / 1000, tz=timezone.utc)
-            if candle_time < start or candle_time > end:
+            # Make start and end timezone-aware for comparison
+            start_utc = start.astimezone(timezone.utc)
+            end_utc = end.astimezone(timezone.utc)
+            if candle_time < start_utc or candle_time > end_utc:
                 continue
-            normalized.append(
+            all_rows.append(
                 {
                     "symbol": symbol,
                     "exchange": "OKX",
@@ -74,7 +88,26 @@ class OkxHistoryClient:
                     "volume": float(volume),
                 }
             )
-        return normalized
+            
+        return all_rows
+
+    async def fetch_candles_async(
+        self,
+        symbol: str,
+        interval: str,
+        start: datetime,
+        end: datetime,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        return await asyncio.get_event_loop().run_in_executor(
+            self._executor,
+            self.fetch_candles,
+            symbol,
+            interval,
+            start,
+            end,
+            limit
+        )
 
 
 class HistorySyncService:
@@ -90,6 +123,7 @@ class HistorySyncService:
         self.history_client = history_client
         self.market_data_repository = market_data_repository
         self.research_run_repository = research_run_repository
+        self._executor = ThreadPoolExecutor(max_workers=4)
 
     def sync(
         self,
@@ -138,4 +172,23 @@ class HistorySyncService:
             duplicates_removed=cleaned.duplicates_removed,
             gaps_detected=cleaned.gaps_detected,
             gaps_filled=cleaned.gaps_filled,
+        )
+
+    async def sync_async(
+        self,
+        *,
+        symbol: str,
+        interval: str,
+        start: datetime,
+        end: datetime,
+        fill_missing: bool,
+    ) -> SyncResult:
+        return await asyncio.get_event_loop().run_in_executor(
+            self._executor,
+            self.sync,
+            symbol,
+            interval,
+            start,
+            end,
+            fill_missing
         )

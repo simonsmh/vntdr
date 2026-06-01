@@ -80,5 +80,5 @@ def test_format_rankings_includes_symbol_and_parameters(env_map: dict[str, str])
         ),
     )
 
-    assert "XAUUSDT cm_macd_ult_mtf 24h ranking" in message
-    assert "params={'fast_length': 3, 'slow_length': 6}" in message
+    assert "XAUUSDT cm_macd_ult_mtf 排名结果" in message
+    assert "参数: {'fast_length': 3, 'slow_length': 6}" in message

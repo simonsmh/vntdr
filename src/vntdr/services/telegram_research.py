@@ -55,7 +55,7 @@ class TelegramResearchService:
         return self.DEFAULT_METHODS[0]
 
     def default_lookback_hours(self) -> int:
-        return self.DEFAULT_LOOKBACK_HOURS
+        return self.settings.research.default_rank_lookback_hours
 
     def default_ranking_intervals(self) -> list[str]:
         return self.available_intervals()
@@ -128,14 +128,23 @@ class TelegramResearchService:
         rankings: list[IntervalResearchResult],
     ) -> str:
         lines = [
-            f"{symbol} {strategy_name} {lookback_hours}h ranking",
-            f"method={method}",
+            f"📊 {symbol} {strategy_name} 排名结果",
+            f"⏱ 回看周期: {lookback_hours}小时 | 优化方法: {method}",
+            "",
         ]
         for index, item in enumerate(rankings, start=1):
+            return_pct = item.total_return * 100
+            drawdown_pct = item.max_drawdown * 100
+            medal = "🥇" if index == 1 else "🥈" if index == 2 else "🥉" if index == 3 else "  "
             lines.append(
-                f"{index}. {item.interval} return={item.total_return:.4f} "
-                f"sharpe={item.sharpe_ratio:.4f} drawdown={item.max_drawdown:.4f} "
-                f"trades={item.trade_count:.0f}"
+                f"{medal} {index}. {item.interval:4s} | 收益: {return_pct:+.2f}% | "
+                f"夏普: {item.sharpe_ratio:.2f} | 回撤: {drawdown_pct:.2f}% | 交易: {item.trade_count:.0f}次"
             )
-            lines.append(f"params={item.best_parameters}")
+            lines.append(f"   参数: {item.best_parameters}")
+            lines.append("")
+        if rankings:
+            best = rankings[0]
+            lines.append(
+                f"💡 推荐使用 {best.interval} 周期，参数如上"
+            )
         return "\n".join(lines)

@@ -38,7 +38,9 @@ def clean_bars(
     if not bars:
         return CleanBarsResult(bars=[], duplicates_removed=duplicates_removed)
 
-    delta = INTERVAL_TO_DELTA.get(interval)
+    # Normalize interval to lowercase for the lookup (OKX requires 4H, we store as 4h)
+    interval_lower = interval.lower()
+    delta = INTERVAL_TO_DELTA.get(interval_lower)
     if delta is None:
         raise ValueError(f"Unsupported interval: {interval}")
 

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import importlib
 import time
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Any
 
@@ -131,6 +133,28 @@ class CommandContext:
         if parameter_space is None:
             parameter_space = self.research_service.default_parameter_space(strategy_name)
         return self.monitoring_service.monitor_once(
+            strategy_name=strategy_name,
+            symbol=symbol,
+            interval=interval,
+            parameter_space=parameter_space,
+            volume=volume,
+            method=method,
+            lookback_bars=self.settings.research.monitor_lookback_bars,
+        )
+
+    async def monitor_once_async(
+        self,
+        *,
+        strategy_name: str,
+        symbol: str,
+        interval: str,
+        method: str,
+        volume: float,
+        parameter_space: dict[str, list[Any]] | None = None,
+    ) -> MonitorResult:
+        if parameter_space is None:
+            parameter_space = self.research_service.default_parameter_space(strategy_name)
+        return await self.monitoring_service.monitor_once_async(
             strategy_name=strategy_name,
             symbol=symbol,
             interval=interval,
@@ -311,8 +335,16 @@ def live_command(
     interval: str | None = typer.Option(None),
     method: str = typer.Option("grid"),
 ) -> None:
+    import logging
+    logger = logging.getLogger(__name__)
+
     settings = Settings.from_env()
     settings.validate_for("live")
+
+    # Apply persistent config overrides before initializing context
+    from vntdr.services.config_service import ConfigService
+    config_service = ConfigService(settings)
+
     context = create_command_context(settings)
     result = context.doctor()
     for line in result.lines():
@@ -322,6 +354,28 @@ def live_command(
     selected_strategy = strategy or settings.research.default_strategy
     selected_symbol = symbol or settings.research.default_symbol
     selected_interval = interval or settings.research.default_interval
+
+    # Reconcile positions from OKX API on startup
+    cache_key = f"signal:{selected_symbol}:{selected_interval}:{selected_strategy}"
+    # Get existing signal from Redis
+    redis_client = redis.from_url(settings.redis.url)
+    existing_signal = context.monitoring_service.signal_store.get(cache_key)
+    
+    if existing_signal is None:
+        logger.info(f"No existing signal found in Redis, reconciling from OKX API positions")
+        try:
+            reconciled_signal = context.monitoring_service.reconcile_positions(symbol=selected_symbol)
+            if reconciled_signal is not None:
+                context.monitoring_service.signal_store.set(cache_key, reconciled_signal)
+                logger.info(f"Reconciled signal {reconciled_signal} saved to cache")
+            else:
+                logger.info("No open positions found on OKX, starting fresh")
+        except Exception as e:
+            logger.error(f"Failed to reconcile positions from OKX: {e}, starting with empty position", exc_info=True)
+            # Don't crash - proceed with monitoring assuming no position
+            pass
+    else:
+        logger.info(f"Found existing signal {existing_signal} in Redis, skipping reconciliation")
 
     def run_monitor_once() -> None:
         monitor_result = context.monitor_once(
@@ -340,22 +394,84 @@ def live_command(
     run_monitor_once()
     if once:
         raise typer.Exit(code=0)
+    
+    # Start Telegram bot in background thread if token is configured
+    if settings.telegram.bot_token and settings.telegram.chat_id:
+        import threading
+        from vntdr.adapters.telegram_bot import TelegramCommandBot
+        from vntdr.services.config_service import ConfigService
+        logger.info("Starting Telegram command bot in background thread")
+        config_service = ConfigService(settings)
+        redis_client = redis.from_url(settings.redis.url)
+        bot = TelegramCommandBot(
+            bot_token=settings.telegram.bot_token.get_secret_value(),
+            chat_id=settings.telegram.chat_id,
+            research_service=context.telegram_research(),
+            monitor_once_callback=context.monitor_once,
+            config_service=config_service,
+            redis_client=redis_client,
+        )
+        # Start bot in a separate daemon thread
+        thread = threading.Thread(target=bot.run, daemon=True)
+        thread.start()
+        logger.info("Telegram bot started in background")
+    
+    # Exponential backoff setup
+    error_count = 0
+    max_backoff = 300  # Maximum backoff in seconds (5 minutes)
+    base_backoff = heartbeat_interval
+
+    # If Telegram bot is active, the main loop should only act as a fallback
+    # or skip monitoring to avoid duplicate notifications with the Bot's job queue.
+    # We'll make it skip if it's already being handled by Telegram JobQueue conceptually,
+    # or just let it run but ensure they use the same interval settings.
+    
     while True:
-        time.sleep(heartbeat_interval)
-        run_monitor_once()
+        try:
+            # Refresh settings/overrides each loop to pick up changes from /config
+            config_service._load_overrides()
+            current_interval = config_service.get("research.default_interval")
+            if current_interval != selected_interval:
+                logger.info(f"Main loop detected interval change: {selected_interval} -> {current_interval}")
+                selected_interval = current_interval
+
+            time.sleep(base_backoff if error_count == 0 else min(base_backoff * (2 ** error_count), max_backoff))
+            run_monitor_once()
+            # Reset error count on success
+            if error_count > 0:
+                logger.info("Monitoring recovered after errors, resetting backoff")
+                error_count = 0
+        except Exception as e:
+            error_count += 1
+            backoff = min(base_backoff * (2 ** error_count), max_backoff)
+            logger.exception(f"Error in monitoring loop (error count: {error_count}), backing off for {backoff} seconds")
+            if error_count >= 5:
+                context.monitoring_service.notifier.notify(
+                    f"⚠️ Monitoring experiencing repeated errors: {e}\nBacking off for {backoff} seconds"
+                )
+            time.sleep(backoff)
 
 
 @app.command("telegram-bot")
 def telegram_bot_command() -> None:
+    import logging
+    logger = logging.getLogger(__name__)
+    
     settings = Settings.from_env()
     settings.validate_for("live")
     context = create_command_context(settings)
     from vntdr.adapters.telegram_bot import TelegramCommandBot
+    from vntdr.services.config_service import ConfigService
 
+    config_service = ConfigService(settings)
+    redis_client = redis.from_url(settings.redis.url)
     bot = TelegramCommandBot(
         bot_token=settings.telegram.bot_token.get_secret_value() if settings.telegram.bot_token else "",
         chat_id=settings.telegram.chat_id or "",
         research_service=context.telegram_research(),
         monitor_once_callback=context.monitor_once,
+        config_service=config_service,
+        redis_client=redis_client,
     )
+    
     bot.run()

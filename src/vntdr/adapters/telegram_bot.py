@@ -1,18 +1,32 @@
 from __future__ import annotations
 
+import json
+import re
 from dataclasses import asdict, dataclass
 from html import escape
-from typing import Final
+from typing import Any, Final, cast
 
-from vntdr.services.telegram_research import TelegramResearchService
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove, Update
+from telegram.constants import ParseMode
+from telegram.error import BadRequest
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    ConversationHandler,
+    MessageHandler,
+    filters,
+)
+
+from vntdr.services.config_service import ConfigService
+from vntdr.services.telegram_research import IntervalResearchResult, TelegramResearchService
 
 SYMBOL: Final[int] = 0
 STRATEGY: Final[int] = 1
 METHOD: Final[int] = 2
 INTERVALS: Final[int] = 3
 LOOKBACK: Final[int] = 4
-MONITOR_INTERVAL: Final[int] = 5
-WATCH_INTERVAL: Final[int] = 6
 
 
 @dataclass
@@ -41,183 +55,245 @@ class TelegramCommandBot:
         chat_id: str,
         research_service: TelegramResearchService,
         monitor_once_callback,
+        config_service: ConfigService | None = None,
+        redis_client=None,
     ) -> None:
         self.bot_token = bot_token
         self.chat_id = str(chat_id)
         self.research_service = research_service
         self.monitor_once_callback = monitor_once_callback
+        self.config_service = config_service
+        self.redis_client = redis_client
+        self.monitor_once_callback_async = getattr(
+            monitor_once_callback, "__self__", None
+        ).monitor_once_async if hasattr(monitor_once_callback, "__self__") else None
         self.watch_job_name = f"watch:{self.chat_id}"
 
-    def build_application(self):
-        from telegram import KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
-        from telegram.ext import (
-            Application,
-            CommandHandler,
-            ContextTypes,
-            ConversationHandler,
-            MessageHandler,
-            filters,
+    # Redis helpers
+    def _redis_key(self, suffix: str) -> str:
+        return f"vntdr:{suffix}:{self.chat_id}"
+
+    @staticmethod
+    def _escape_markdown_v2(text: str) -> str:
+        """Escape special characters for Telegram MarkdownV2."""
+        # Characters that must be escaped outside code blocks
+        # \ ` * _ [ ] ( ) ~ > # + - = | { } . !
+        escape_chars = r"\_*[]()~`>#+-=|{}.!"
+        return re.sub(f"([{re.escape(escape_chars)}])", r"\\\1", text)
+
+    async def _send_safe(
+        self, 
+        update_or_query_or_id: Any, 
+        text: str, 
+        reply_markup: InlineKeyboardMarkup | None = None,
+        edit: bool = False
+    ) -> None:
+        """
+        Send message with MarkdownV2 and fallback to Plain Text on error.
+        """
+        # 1. Base escaping for MarkdownV2 (outside code/links)
+        # Note: We don't escape everything here because our formatting (like *)
+        # would be broken. We rely on the fallback for complex cases.
+        # But we MUST escape common troublemakers in data like . and -
+        
+        # 2. Determine target and send method
+        from telegram.ext import Application
+        bot = None
+        target_chat_id = self.chat_id
+        
+        target = update_or_query_or_id
+        if isinstance(target, str):
+            # If it's just a chat_id string
+            target_chat_id = target
+            # Need access to bot instance - can get from context if we had it, 
+            # or use the bot_token to create a temporary one, 
+            # but better to use the active application bot
+            pass 
+        elif hasattr(target, "callback_query") and target.callback_query:
+            target = target.callback_query
+        
+        # Helper to get bot from update/query context if possible
+        if hasattr(target, "bot"):
+            bot = target.bot
+
+        try:
+            if edit and hasattr(target, "edit_message_text"):
+                await target.edit_message_text(text, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=reply_markup)
+            elif hasattr(target, "reply_text"):
+                await target.reply_text(text, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=reply_markup)
+            elif bot:
+                await bot.send_message(chat_id=target_chat_id, text=text, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=reply_markup)
+        except BadRequest as e:
+            if "Can't parse entities" in str(e):
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.warning(f"MarkdownV2 parsing failed: {e}. Falling back to plain text.")
+                
+                # Standard Markdown to Plain Text: strip some common markers for better fallback readability
+                clean_text = text.replace("*", "").replace("`", "")
+                
+                fallback_text = (
+                    f"{clean_text}\n\n"
+                    f"⚠️ 该消息 Markdown 格式 Telegram 解析失败，已转为纯文本。请检查特殊字符并重试。\n\n"
+                    f"(Telegram error: {e.message})"
+                )
+                
+                if edit and hasattr(target, "edit_message_text"):
+                    await target.edit_message_text(fallback_text, reply_markup=reply_markup)
+                elif hasattr(target, "reply_text"):
+                    await target.reply_text(fallback_text, reply_markup=reply_markup)
+                elif bot:
+                    await bot.send_message(chat_id=target_chat_id, text=fallback_text, reply_markup=reply_markup)
+            else:
+                raise e
+
+    def _save_last_rank(self, rank_config: RankConfig, rankings: list[IntervalResearchResult]) -> None:
+        if self.redis_client is None:
+            return
+        payload = {
+            "symbol": rank_config.symbol,
+            "strategy_name": rank_config.strategy_name,
+            "method": rank_config.method,
+            "intervals": rank_config.intervals,
+            "lookback_hours": rank_config.lookback_hours,
+            "rankings": [
+                {
+                    "interval": r.interval,
+                    "total_return": r.total_return,
+                    "sharpe_ratio": r.sharpe_ratio,
+                    "max_drawdown": r.max_drawdown,
+                    "trade_count": r.trade_count,
+                    "best_parameters": r.best_parameters,
+                }
+                for r in rankings
+            ],
+        }
+        self.redis_client.set(self._redis_key("rank:last"), json.dumps(payload, ensure_ascii=False), ex=86400 * 7)
+
+    def _load_last_rank(self) -> dict[str, Any] | None:
+        if self.redis_client is None:
+            return None
+        raw = self.redis_client.get(self._redis_key("rank:last"))
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except Exception:
+            return None
+
+    def _save_watch_config(self, config: WatchConfig) -> None:
+        if self.redis_client is None:
+            return
+        self.redis_client.set(
+            self._redis_key("watch"),
+            json.dumps(asdict(config), ensure_ascii=False),
+            ex=86400 * 30,
         )
 
+    def _load_watch_config(self) -> WatchConfig | None:
+        if self.redis_client is None:
+            return None
+        raw = self.redis_client.get(self._redis_key("watch"))
+        if not raw:
+            return None
+        try:
+            return WatchConfig(**json.loads(raw))
+        except Exception:
+            return None
+
+    def _delete_watch_config(self) -> None:
+        if self.redis_client is not None:
+            self.redis_client.delete(self._redis_key("watch"))
+
+    def build_application(self):
         async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             if not self._allowed_chat(update):
                 return
-            await update.message.reply_text(
-                "发送 /rank 开始交互式回测排序，/monitor 执行一次监控，/watch 开启持续监控，/watch_top 自动监控第一名周期。"
+            keyboard = [
+                [InlineKeyboardButton("📊 回测排名", callback_data="m:rank")],
+                [InlineKeyboardButton("▶️ 执行监控", callback_data="m:run")],
+                [InlineKeyboardButton("🔁 自动监控", callback_data="m:auto")],
+                [InlineKeyboardButton("📋 状态面板", callback_data="m:status")],
+                [InlineKeyboardButton("⚙️ 配置管理", callback_data="m:config")],
+            ]
+            text = (
+                "🤖 *Vntdr 量化交易机器人*\n\n"
+                "发送命令或点击下方按钮操作：\n"
+                "• `/rank [交易对] [小时]` — 回测排序\n"
+                "• `/run <交易对> <周期> [策略] [方法]` — 执行一次监控\n"
+                "• `/auto [交易对] [秒]` — 自动排名并监控最佳周期\n"
+                "• `/status` — 查看全局面板\n"
+                "• `/config` — 配置管理\n"
+                "• `/stop` — 停止自动监控\n"
+                "• `/cancel` — 取消当前操作\n"
             )
+            await self._send_safe(update, text, reply_markup=InlineKeyboardMarkup(keyboard))
 
-        async def rank_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        async def rank_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             if not self._allowed_chat(update):
-                return ConversationHandler.END
+                return
             args = context.args
-            if args:
-                context.user_data["symbol"] = args[0].upper()
-                return await ask_strategy(update, context)
-            await update.message.reply_text("请输入交易品种，例如 XAUUSDT。")
-            return SYMBOL
+            symbol = args[0].upper() if args else self.research_service.default_symbol()
+            lookback_hours = self.research_service.default_lookback_hours()
 
-        async def receive_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-            context.user_data["symbol"] = update.message.text.strip().upper()
-            return await ask_strategy(update, context)
+            if len(args) >= 2:
+                try:
+                    hour_str = args[1].lower().rstrip("h")
+                    lookback_hours = max(1, int(hour_str))
+                except ValueError:
+                    pass
 
-        async def ask_strategy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-            strategies = self.research_service.available_strategies()
-            keyboard = [[KeyboardButton(name)] for name in strategies]
-            await update.message.reply_text(
-                "选择策略。",
-                reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True),
-            )
-            return STRATEGY
-
-        async def receive_strategy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-            context.user_data["strategy_name"] = update.message.text.strip()
-            methods = self.research_service.available_methods()
-            keyboard = [[KeyboardButton(name)] for name in methods]
-            await update.message.reply_text(
-                "选择优化方法。",
-                reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True),
-            )
-            return METHOD
-
-        async def receive_method(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-            context.user_data["method"] = update.message.text.strip().lower()
-            await update.message.reply_text(
-                "请输入时间周期，多个用逗号分隔，例如 15m,30m,1h,4h。",
-                reply_markup=ReplyKeyboardRemove(),
-            )
-            return INTERVALS
-
-        async def receive_intervals(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-            raw = update.message.text.strip()
-            context.user_data["intervals"] = [part.strip().lower() for part in raw.split(",") if part.strip()]
-            await update.message.reply_text("请输入回看小时数，例如 24。")
-            return LOOKBACK
-
-        async def receive_lookback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-            lookback_hours = int(update.message.text.strip())
             rank_config = RankConfig(
-                symbol=str(context.user_data["symbol"]),
-                strategy_name=str(context.user_data["strategy_name"]),
-                method=str(context.user_data["method"]),
-                intervals=list(context.user_data["intervals"]),
+                symbol=symbol,
+                strategy_name=self.research_service.default_strategy(),
+                method=self.research_service.default_method(),
+                intervals=self.research_service.available_intervals(),
                 lookback_hours=lookback_hours,
             )
-            rankings = await self._run_ranking(update, context, rank_config)
-            if rankings:
-                await update.message.reply_text(
-                    f"当前最佳周期为 {rankings[0].interval}。发送 /monitor 可按该配置执行一次监控和下单。"
-                )
-            return ConversationHandler.END
+            await self._execute_rank(update, context, rank_config)
 
-        async def monitor_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        async def run_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             if not self._allowed_chat(update):
-                return ConversationHandler.END
-            if not context.user_data.get("symbol") or not context.user_data.get("strategy_name"):
-                await update.message.reply_text("请先发送 /rank 完成一次品种与策略选择。")
-                return ConversationHandler.END
-            keyboard = [[KeyboardButton(interval)] for interval in self.research_service.available_intervals()]
-            await update.message.reply_text(
-                "选择要监控的周期，默认建议使用刚才排名第一的周期。",
-                reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True),
-            )
-            return MONITOR_INTERVAL
-
-        async def receive_monitor_interval(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-            interval = update.message.text.strip().lower()
-            symbol = str(context.user_data["symbol"])
-            strategy_name = str(context.user_data["strategy_name"])
-            method = str(context.user_data.get("method", "grid"))
-            await update.message.reply_text("开始执行监控，请稍候。", reply_markup=ReplyKeyboardRemove())
-            result = self.monitor_once_callback(
-                strategy_name=strategy_name,
-                symbol=symbol,
-                interval=interval,
-                method=method,
-            )
-            context.user_data["monitor_interval"] = interval
-            await update.message.reply_text(self._format_monitor_result(result))
-            return ConversationHandler.END
-
-        async def watch_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-            if not self._allowed_chat(update):
-                return ConversationHandler.END
-            if not context.user_data.get("symbol") or not context.user_data.get("strategy_name"):
-                await update.message.reply_text("请先发送 /rank 完成一次品种与策略选择。")
-                return ConversationHandler.END
-            keyboard = [[KeyboardButton(interval)] for interval in self.research_service.available_intervals()]
-            await update.message.reply_text(
-                "选择持续监控的周期。",
-                reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True),
-            )
-            return WATCH_INTERVAL
-
-        async def watch_top_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-            if not self._allowed_chat(update):
-                return ConversationHandler.END
+                return
             args = context.args
+            if len(args) < 2:
+                await self._send_safe(
+                    update,
+                    "用法: `/run <交易对> <周期> [策略] [方法]`\n"
+                    "例如: `/run XAU-USDT-SWAP 4h` 或 `/run XAU-USDT-SWAP 4h cm_macd_ult_mtf grid`"
+                )
+                return
+            symbol = args[0].upper()
+            interval = args[1].lower()
+            strategy_name = args[2] if len(args) >= 3 else self.research_service.default_strategy()
+            method = args[3].lower() if len(args) >= 4 else self.research_service.default_method()
+
+            await self._send_safe(update, f"▶️ 开始执行监控: `{symbol}` `{interval}` (`{strategy_name}`/`{method}`)")
+            result = await self._do_monitor(strategy_name, symbol, interval, method, context)
+            await self._send_safe(update, self._format_monitor_result(result))
+
+        async def auto_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+            if not self._allowed_chat(update):
+                return
+            args = context.args
+            symbol = args[0].upper() if args else self.research_service.default_symbol()
+            poll_seconds = 60
             if len(args) >= 2:
-                context.user_data["watch_top_symbol"] = args[0].upper()
-                context.user_data["watch_top_poll_seconds"] = max(5, int(args[1]))
-                return await run_watch_top(update, context)
-            if len(args) == 1:
-                raw = args[0]
-                if raw.isdigit():
-                    context.user_data["watch_top_poll_seconds"] = max(5, int(raw))
-                else:
-                    context.user_data["watch_top_symbol"] = raw.upper()
-            return await run_watch_top(update, context)
+                try:
+                    poll_seconds = max(5, int(args[1]))
+                except ValueError:
+                    pass
 
-        async def receive_watch_interval(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-            interval = update.message.text.strip().lower()
-            context.user_data["monitor_interval"] = interval
-            await update.message.reply_text(
-                "请输入轮询秒数，例如 60。",
-                reply_markup=ReplyKeyboardRemove(),
+            rank_config = RankConfig(
+                symbol=symbol,
+                strategy_name=self.research_service.default_strategy(),
+                method=self.research_service.default_method(),
+                intervals=self.research_service.available_intervals(),
+                lookback_hours=self.research_service.default_lookback_hours(),
             )
-            return LOOKBACK
-
-        async def receive_watch_seconds(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-            poll_seconds = max(5, int(update.message.text.strip()))
-            config = WatchConfig(
-                symbol=str(context.user_data["symbol"]),
-                strategy_name=str(context.user_data["strategy_name"]),
-                interval=str(context.user_data["monitor_interval"]),
-                method=str(context.user_data.get("method", "grid")),
-                poll_seconds=poll_seconds,
-            )
-            self._replace_watch_job(context, config)
-            await update.message.reply_text(
-                f"已开启持续监控: {config.symbol} {config.strategy_name} {config.interval} 每 {config.poll_seconds} 秒一次。"
-            )
-            return ConversationHandler.END
-
-        async def run_watch_top(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-            rank_config = self._resolve_watch_top_rank_config(context)
-            rankings = await self._run_ranking(update, context, rank_config)
+            rankings = await self._execute_rank(update, context, rank_config)
             if not rankings:
-                await update.message.reply_text("没有得到可用的周期排名，未开启持续监控。")
-                return ConversationHandler.END
-            poll_seconds = int(context.user_data.get("watch_top_poll_seconds", 60))
+                return
             watch_config = WatchConfig(
                 symbol=rank_config.symbol,
                 strategy_name=rank_config.strategy_name,
@@ -226,90 +302,553 @@ class TelegramCommandBot:
                 poll_seconds=poll_seconds,
             )
             self._replace_watch_job(context, watch_config)
-            await update.message.reply_text(
-                f"已按第一名周期 {watch_config.interval} 开启持续监控，每 {watch_config.poll_seconds} 秒一次。"
+            await self._send_safe(
+                update,
+                f"🔁 已按最佳周期 `{watch_config.interval}` 开启自动监控，\n"
+                f"每 `{watch_config.poll_seconds}` 秒执行一次。\n发送 /stop 可停止。"
             )
-            return ConversationHandler.END
 
-        async def watch_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             if not self._allowed_chat(update):
                 return
-            config = self._get_watch_config(context)
-            if config is None:
-                await update.message.reply_text("当前没有运行中的持续监控。")
-                return
-            await update.message.reply_text(self._format_watch_status(config))
+            lines = ["📋 *Vntdr 状态面板*", ""]
 
-        async def watch_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+            # Watch status
+            watch = self._get_watch_config(context)
+            if watch:
+                lines.append(
+                    f"🔴 *自动监控运行中*\n"
+                    f"  交易对: `{watch.symbol}`\n"
+                    f"  策略: `{watch.strategy_name}`\n"
+                    f"  周期: `{watch.interval}`\n"
+                    f"  方法: `{watch.method}`\n"
+                    f"  轮询: `{watch.poll_seconds}` 秒"
+                )
+            else:
+                lines.append("🟢 *自动监控*: 未运行")
+            lines.append("")
+
+            # Last rank
+            last_rank = self._load_last_rank()
+            if last_rank and last_rank.get("rankings"):
+                lines.append(
+                    f"📊 *最近排名* ({last_rank['symbol']} / {last_rank['lookback_hours']}h)"
+                )
+                for i, r in enumerate(last_rank["rankings"][:3], 1):
+                    medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉"
+                    lines.append(
+                        f"{medal} `{r['interval']}` | 收益: {r['total_return'] * 100:+.2f}% | "
+                        f"夏普: {r['sharpe_ratio']:.2f}"
+                    )
+            else:
+                lines.append("📊 *最近排名*: 无数据，发送 /rank 生成")
+
+            keyboard = [
+                [InlineKeyboardButton("📊 新排名", callback_data="m:rank")],
+                [InlineKeyboardButton("▶️ 运行最佳", callback_data="r:best")],
+                [InlineKeyboardButton("🛑 停止监控", callback_data="stop")],
+            ]
+            await self._send_safe(
+                update,
+                "\n".join(lines),
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+
+        async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             if not self._allowed_chat(update):
                 return
             removed = self._remove_watch_job(context)
             if removed:
-                await update.message.reply_text("已停止持续监控。")
+                await self._send_safe(update, "🛑 已停止自动监控。")
             else:
-                await update.message.reply_text("当前没有运行中的持续监控。")
+                await self._send_safe(update, "ℹ️ 当前没有运行中的自动监控。")
+
+        # Callback query handler for InlineKeyboard
+        async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+            if not self._allowed_chat(update):
+                await update.callback_query.answer("无权访问")
+                return
+            query = update.callback_query
+            await query.answer()
+            data = query.data
+
+            if data == "m:rank":
+                # Show rank with default symbol
+                rank_config = RankConfig(
+                    symbol=self.research_service.default_symbol(),
+                    strategy_name=self.research_service.default_strategy(),
+                    method=self.research_service.default_method(),
+                    intervals=self.research_service.available_intervals(),
+                    lookback_hours=self.research_service.default_lookback_hours(),
+                )
+                await self._execute_rank(query, context, rank_config, edit=True)
+            elif data == "m:run":
+                await self._send_safe(
+                    query,
+                    "请直接发送命令：\n"
+                    "`/run <交易对> <周期> [策略] [方法]`\n"
+                    "例如: `/run XAU-USDT-SWAP 4h`",
+                    edit=True
+                )
+            elif data == "m:auto":
+                rank_config = RankConfig(
+                    symbol=self.research_service.default_symbol(),
+                    strategy_name=self.research_service.default_strategy(),
+                    method=self.research_service.default_method(),
+                    intervals=self.research_service.available_intervals(),
+                    lookback_hours=self.research_service.default_lookback_hours(),
+                )
+                rankings = await self._execute_rank(query, context, rank_config, edit=True)
+                if rankings:
+                    watch_config = WatchConfig(
+                        symbol=rank_config.symbol,
+                        strategy_name=rank_config.strategy_name,
+                        interval=rankings[0].interval,
+                        method=rank_config.method,
+                        poll_seconds=60,
+                    )
+                    self._replace_watch_job(context, watch_config)
+                    await self._send_safe(
+                        query,
+                        f"🔁 已按最佳周期 `{watch_config.interval}` 开启自动监控，每 `{watch_config.poll_seconds}` 秒一次。"
+                    )
+            elif data == "m:status":
+                # Reuse status logic but send as new message
+                watch = self._get_watch_config(context)
+                lines = ["📋 *Vntdr 状态面板*", ""]
+                if watch:
+                    lines.append(
+                        f"🔴 *自动监控运行中*\n"
+                        f"  交易对: `{watch.symbol}`\n"
+                        f"  周期: `{watch.interval}`\n"
+                        f"  轮询: `{watch.poll_seconds}` 秒"
+                    )
+                else:
+                    lines.append("🟢 *自动监控*: 未运行")
+                lines.append("")
+                last_rank = self._load_last_rank()
+                if last_rank and last_rank.get("rankings"):
+                    lines.append(f"📊 *最近排名* ({last_rank['symbol']})")
+                    for i, r in enumerate(last_rank["rankings"][:3], 1):
+                        medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉"
+                        lines.append(
+                            f"{medal} `{r['interval']}` | 收益: {r['total_return'] * 100:+.2f}%"
+                        )
+                else:
+                    lines.append("📊 *最近排名*: 无数据")
+                await self._send_safe(query, "\n".join(lines), edit=True)
+            elif data == "m:config":
+                await self._send_safe(query, "请发送 /config 进入配置管理。", edit=True)
+            elif data == "stop":
+                removed = self._remove_watch_job(context)
+                await self._send_safe(
+                    query,
+                    "🛑 已停止自动监控。" if removed else "ℹ️ 当前没有运行中的自动监控。",
+                    edit=True
+                )
+            elif data == "rr":
+                # Rerun last rank
+                last_rank = self._load_last_rank()
+                if last_rank:
+                    rank_config = RankConfig(
+                        symbol=last_rank["symbol"],
+                        strategy_name=last_rank["strategy_name"],
+                        method=last_rank["method"],
+                        intervals=last_rank["intervals"],
+                        lookback_hours=last_rank["lookback_hours"],
+                    )
+                else:
+                    rank_config = RankConfig(
+                        symbol=self.research_service.default_symbol(),
+                        strategy_name=self.research_service.default_strategy(),
+                        method=self.research_service.default_method(),
+                        intervals=self.research_service.available_intervals(),
+                        lookback_hours=self.research_service.default_lookback_hours(),
+                    )
+                await self._execute_rank(query, context, rank_config, edit=True)
+            elif data.startswith("r:"):
+                interval = data[2:]
+                if interval == "best":
+                    last_rank = self._load_last_rank()
+                    if not last_rank or not last_rank.get("rankings"):
+                        await query.edit_message_text("无最近排名数据，请先执行 /rank")
+                        return
+                    interval = last_rank["rankings"][0]["interval"]
+                    symbol = last_rank["symbol"]
+                    strategy_name = last_rank["strategy_name"]
+                    method = last_rank["method"]
+                else:
+                    symbol = context.user_data.get("symbol") or self.research_service.default_symbol()
+                    strategy_name = context.user_data.get("strategy_name") or self.research_service.default_strategy()
+                    method = context.user_data.get("method") or self.research_service.default_method()
+                await self._send_safe(query, f"▶️ 开始执行监控: `{symbol}` `{interval}`", edit=True)
+                result = await self._do_monitor(strategy_name, symbol, interval, method, context)
+                await self._send_safe(query, self._format_monitor_result(result))
+            elif data.startswith("a:"):
+                interval = data[2:]
+                symbol = context.user_data.get("symbol") or self.research_service.default_symbol()
+                strategy_name = context.user_data.get("strategy_name") or self.research_service.default_strategy()
+                method = context.user_data.get("method") or self.research_service.default_method()
+                watch_config = WatchConfig(
+                    symbol=symbol,
+                    strategy_name=strategy_name,
+                    interval=interval,
+                    method=method,
+                    poll_seconds=60,
+                )
+                self._replace_watch_job(context, watch_config)
+                await self._send_safe(
+                    query,
+                    f"🔁 已按 `{interval}` 开启自动监控，每 `{watch_config.poll_seconds}` 秒一次。",
+                    edit=True
+                )
+
+        # Config conversation (keep interactive)
+        CONFIG_SELECT, CONFIG_VALUE = range(2)
+
+        async def config_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+            if not self._allowed_chat(update):
+                return ConversationHandler.END
+            if self.config_service is None:
+                await update.message.reply_text("⚠️ 配置服务未启用。")
+                return ConversationHandler.END
+
+            configs = self.config_service.list_all()
+            labels = self.config_service.CONFIG_LABELS
+            context.user_data["all_configs"] = list(sorted(configs.keys()))
+
+            lines = ["⚙️ 配置管理 - 当前值：", ""]
+            for key in sorted(configs.keys()):
+                value = configs[key]
+                label = labels.get(key, key)
+                if isinstance(value, float):
+                    value_str = f"{value:.4f}"
+                else:
+                    value_str = str(value)
+                lines.append(f"  {label} = `{value_str}`")
+            lines.extend(["", "👇 请点击下方按钮选择要修改的配置项："])
+
+            keyboard = [[InlineKeyboardButton(labels.get(key, key), callback_data=f"cfg:{key}")] for key in sorted(configs.keys())]
+            keyboard.append([InlineKeyboardButton("❌ 取消", callback_data="cfg:cancel")])
+
+            context.user_data["key_to_label"] = labels
+            context.user_data["label_to_key"] = {v: k for k, v in labels.items()}
+
+            await self._send_safe(
+                update,
+                "\n".join(lines),
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            return CONFIG_SELECT
+
+        async def config_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+            """Handle config inline keyboard callbacks"""
+            if not self._allowed_chat(update):
+                await update.callback_query.answer("无权访问")
+                return
+            query = update.callback_query
+            await query.answer()
+            data = query.data
+
+            if data == "cfg:cancel":
+                await self._send_safe(query, "已取消配置修改。", edit=True)
+                return
+
+            if data.startswith("cfg:"):
+                key = data[4:]
+                selected_label = context.user_data.get("key_to_label", {}).get(key, key)
+                context.user_data["selected_config"] = key
+                context.user_data["selected_label"] = selected_label
+                current_value = self.config_service.get(key)
+
+                if isinstance(current_value, bool):
+                    keyboard = [
+                        [InlineKeyboardButton("是 ✅", callback_data="cfgv:true"), InlineKeyboardButton("否 ❌", callback_data="cfgv:false")],
+                        [InlineKeyboardButton("❌ 取消", callback_data="cfg:cancel")],
+                    ]
+                    await self._send_safe(
+                        query,
+                        f"当前 `{selected_label}` = `{'是' if current_value else '否'}`\n\n请选择新值：",
+                        reply_markup=InlineKeyboardMarkup(keyboard),
+                        edit=True
+                    )
+                else:
+                    if isinstance(current_value, float):
+                        value_str = f"{current_value:.4f}"
+                    else:
+                        value_str = str(current_value)
+                    await self._send_safe(
+                        query,
+                        f"当前 `{selected_label}` = `{value_str}`\n\n请直接输入新值（发送 /cancel 取消）：",
+                        edit=True
+                    )
+                    # Store state to know we're waiting for config value
+                    context.user_data["awaiting_config_value"] = True
+                return
+
+            if data.startswith("cfgv:"):
+                raw = data[5:]
+                new_value = "true" if raw == "true" else "false"
+                selected = context.user_data.get("selected_config")
+                selected_label = context.user_data.get("selected_label", selected)
+                if not selected:
+                    await query.edit_message_text("会话已过期，请重新执行 /config。")
+                    return
+                success = self.config_service.set(selected, new_value)
+                if success:
+                    final_value = self.config_service.get(selected)
+                    value_str = "是" if final_value else "否" if isinstance(final_value, bool) else f"{final_value:.4f}" if isinstance(final_value, float) else str(final_value)
+                    await self._send_safe(query, f"✅ 配置已更新：\n`{selected_label}` = `{value_str}`", edit=True)
+                else:
+                    await self._send_safe(query, "❌ 设置失败，请检查值格式。", edit=True)
+                context.user_data.pop("awaiting_config_value", None)
+                return
+
+        async def config_fallback_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+            """Handle text input when in config conversation waiting for value"""
+            if not self._allowed_chat(update):
+                return ConversationHandler.END
+            if not context.user_data.get("awaiting_config_value"):
+                return ConversationHandler.END
+
+            selected = context.user_data.get("selected_config")
+            selected_label = context.user_data.get("selected_label", selected)
+            if not selected:
+                await self._send_safe(update, "会话已过期，请重新执行 /config。")
+                return ConversationHandler.END
+
+            new_value = update.message.text.strip()
+            success = self.config_service.set(selected, new_value)
+            if success:
+                final_value = self.config_service.get(selected)
+                if isinstance(final_value, bool):
+                    value_str = "是" if final_value else "否"
+                elif isinstance(final_value, float):
+                    value_str = f"{final_value:.4f}"
+                else:
+                    value_str = str(final_value)
+                await self._send_safe(
+                    update,
+                    f"✅ 配置已更新：\n`{selected_label}` = `{value_str}`"
+                )
+            else:
+                await self._send_safe(update, "❌ 设置失败，请检查值格式是否正确。")
+            context.user_data.pop("awaiting_config_value", None)
+            return ConversationHandler.END
 
         async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             if self._allowed_chat(update):
-                await update.message.reply_text("已取消当前回测会话。", reply_markup=ReplyKeyboardRemove())
+                await self._send_safe(update, "已取消当前操作。")
+            context.user_data.pop("awaiting_config_value", None)
             return ConversationHandler.END
 
         application = Application.builder().token(self.bot_token).build()
         if application.job_queue is None:
             raise RuntimeError("Telegram job queue is unavailable. Install python-telegram-bot with job-queue extras.")
-        rank_conversation = ConversationHandler(
-            entry_points=[CommandHandler("rank", rank_entry)],
+
+        # Config conversation handler
+        config_conversation = ConversationHandler(
+            entry_points=[CommandHandler("config", config_entry)],
             states={
-                SYMBOL: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_symbol)],
-                STRATEGY: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_strategy)],
-                METHOD: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_method)],
-                INTERVALS: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_intervals)],
-                LOOKBACK: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_lookback)],
+                CONFIG_SELECT: [
+                    CallbackQueryHandler(config_callback, pattern=r"^cfg:"),
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, config_fallback_text),
+                ],
+                CONFIG_VALUE: [
+                    CallbackQueryHandler(config_callback, pattern=r"^cfgv:"),
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, config_fallback_text),
+                ],
             },
             fallbacks=[CommandHandler("cancel", cancel)],
         )
-        monitor_conversation = ConversationHandler(
-            entry_points=[CommandHandler("monitor", monitor_entry)],
-            states={
-                MONITOR_INTERVAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_monitor_interval)],
-            },
-            fallbacks=[CommandHandler("cancel", cancel)],
-        )
-        watch_conversation = ConversationHandler(
-            entry_points=[CommandHandler("watch", watch_entry)],
-            states={
-                WATCH_INTERVAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_watch_interval)],
-                LOOKBACK: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_watch_seconds)],
-            },
-            fallbacks=[CommandHandler("cancel", cancel)],
-        )
+
         application.add_handler(CommandHandler("start", start))
-        application.add_handler(rank_conversation)
-        application.add_handler(monitor_conversation)
-        application.add_handler(watch_conversation)
-        application.add_handler(CommandHandler("watch_top", watch_top_entry))
-        application.add_handler(CommandHandler("watch_status", watch_status))
-        application.add_handler(CommandHandler("watch_stop", watch_stop))
+        application.add_handler(CommandHandler("rank", rank_command))
+        application.add_handler(CommandHandler("run", run_command))
+        application.add_handler(CommandHandler("auto", auto_command))
+        application.add_handler(CommandHandler("status", status_command))
+        application.add_handler(CommandHandler("stop", stop_command))
+        application.add_handler(config_conversation)
+        application.add_handler(CallbackQueryHandler(button_callback))
+
+        # Startup tasks: set commands and resume jobs
+        async def on_startup(app: Application):
+            # 1. Set bot commands for autocomplete
+            commands = [
+                BotCommand("start", "开始使用/主菜单"),
+                BotCommand("rank", "回测排序，可选参数: [交易对] [小时]"),
+                BotCommand("run", "执行一次监控: <交易对> <周期> [策略] [方法]"),
+                BotCommand("auto", "自动排名并监控最佳周期"),
+                BotCommand("status", "查看全局面板"),
+                BotCommand("config", "查看和修改配置"),
+                BotCommand("stop", "停止自动监控"),
+                BotCommand("cancel", "取消当前操作"),
+            ]
+            await app.bot.set_my_commands(commands)
+            
+            # 2. Resume watch job from Redis if it exists
+            import logging
+            logger = logging.getLogger(__name__)
+            config = self._load_watch_config()
+            if config:
+                logger.info(f"Resuming watch job from Redis: {config}")
+                job_queue = app.job_queue
+                if job_queue:
+                    # Clean up any existing job with same name just in case
+                    existing_jobs = job_queue.get_jobs_by_name(self.watch_job_name)
+                    for job in existing_jobs:
+                        job.schedule_removal()
+                        
+                    job_queue.run_repeating(
+                        self._build_watch_callback(),
+                        interval=config.poll_seconds,
+                        first=5, # Give a small delay on startup
+                        name=self.watch_job_name,
+                        data=asdict(config),
+                    )
+                    logger.info("Watch job resumed successfully")
+
+        application.post_init = on_startup
         return application
 
+    async def _execute_rank(
+        self,
+        update_or_query,
+        context: ContextTypes.DEFAULT_TYPE,
+        rank_config: RankConfig,
+        edit: bool = False,
+    ) -> list[IntervalResearchResult]:
+        """Execute ranking and send results with inline keyboard."""
+        await self._send_safe(update_or_query, "📊 开始拉取数据并计算排名，请稍候...", edit=edit)
+        
+        import asyncio
+        loop = asyncio.get_event_loop()
+        rankings = await loop.run_in_executor(
+            None,
+            lambda: self.research_service.rank_intervals(
+                symbol=rank_config.symbol,
+                strategy_name=rank_config.strategy_name,
+                method=rank_config.method,
+                intervals=rank_config.intervals,
+                lookback_hours=rank_config.lookback_hours,
+            ),
+        )
+        self._save_last_rank(rank_config, rankings)
+        context.user_data["symbol"] = rank_config.symbol
+        context.user_data["strategy_name"] = rank_config.strategy_name
+        context.user_data["method"] = rank_config.method
+
+        text = self.research_service.format_rankings(
+            symbol=rank_config.symbol,
+            strategy_name=rank_config.strategy_name,
+            method=rank_config.method,
+            lookback_hours=rank_config.lookback_hours,
+            rankings=rankings,
+        )
+
+        # Build inline keyboard for each interval
+        keyboard = []
+        if rankings:
+            for r in rankings[:3]:
+                keyboard.append([
+                    InlineKeyboardButton(f"▶️ 运行 {r.interval}", callback_data=f"r:{r.interval}"),
+                    InlineKeyboardButton(f"🔁 自动 {r.interval}", callback_data=f"a:{r.interval}"),
+                ])
+            keyboard.append([InlineKeyboardButton("🔄 重新排名", callback_data="rr")])
+            keyboard.append([InlineKeyboardButton("📋 状态面板", callback_data="m:status")])
+
+        await self._send_safe(
+            update_or_query,
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
+            edit=edit
+        )
+        return rankings
+
+    async def _do_monitor(
+        self,
+        strategy_name: str,
+        symbol: str,
+        interval: str,
+        method: str,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> Any:
+        volume = context.bot_data.get("default_order_size", 1.0)
+        if self.monitor_once_callback_async is not None:
+            return await self.monitor_once_callback_async(
+                strategy_name=strategy_name,
+                symbol=symbol,
+                interval=interval,
+                method=method,
+                volume=volume,
+            )
+        return self.monitor_once_callback(
+            strategy_name=strategy_name,
+            symbol=symbol,
+            interval=interval,
+            method=method,
+            volume=volume,
+        )
+
     def run(self) -> None:
+        """Run the bot in background thread with polling."""
+        import asyncio
         application = self.build_application()
-        application.run_polling(allowed_updates=["message"])
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(application.run_polling(
+            allowed_updates=["message", "callback_query"],
+            stop_signals=None,
+        ))
 
     def _allowed_chat(self, update) -> bool:
-        message = getattr(update, "message", None)
-        if message is None or message.chat_id is None:
-            return False
-        return str(message.chat_id) == self.chat_id
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        user_id = update.effective_user.id if update.effective_user else None
+        chat_id = update.effective_chat.id if update.effective_chat else None
+        
+        # Also check message.chat_id and callback_query.message.chat.id
+        # as fallbacks if effective_chat is somehow None or different
+        message_chat_id = None
+        if update.message and update.message.chat_id:
+            message_chat_id = update.message.chat_id
+        elif update.callback_query and update.callback_query.message and update.callback_query.message.chat_id:
+            message_chat_id = update.callback_query.message.chat_id
+            
+        is_allowed = (
+            str(user_id) == self.chat_id or 
+            str(chat_id) == self.chat_id or 
+            str(message_chat_id) == self.chat_id
+        )
+        
+        # If still not allowed, try numeric comparison
+        if not is_allowed:
+            try:
+                target_id_num = int(self.chat_id)
+                is_allowed = (
+                    user_id == target_id_num or 
+                    chat_id == target_id_num or 
+                    message_chat_id == target_id_num
+                )
+            except (ValueError, TypeError):
+                pass
+        
+        if not is_allowed:
+            logger.warning(f"Access denied. Configured: {self.chat_id}, Effective User: {user_id}, Effective Chat: {chat_id}, Msg Chat: {message_chat_id}")
+            
+        return is_allowed
 
     def _format_monitor_result(self, result) -> str:
         actions = ", ".join(result.actions) if result.actions else "none"
         return (
-            f"monitor {escape(result.symbol)} {escape(result.interval)}\n"
-            f"strategy={escape(result.strategy_name)} signal={result.signal} previous={result.previous_signal}\n"
-            f"actions={actions}\n"
-            f"parameters={result.best_parameters}\n"
-            f"notified={result.notification_sent}"
+            f"✅ *监控完成*\n"
+            f"`{self._escape_markdown_v2(result.symbol)}` `{self._escape_markdown_v2(result.interval)}`\n"
+            f"策略: `{self._escape_markdown_v2(result.strategy_name)}`\n"
+            f"信号: `{result.signal}` | 前信号: `{result.previous_signal}`\n"
+            f"操作: `{self._escape_markdown_v2(actions)}`\n"
+            f"参数: `{self._escape_markdown_v2(str(result.best_parameters))}`\n"
+            f"通知: `{'已发送' if result.notification_sent else '无'}`"
         )
 
     def _replace_watch_job(self, context, config: WatchConfig) -> None:
@@ -323,108 +862,48 @@ class TelegramCommandBot:
             data=asdict(config),
         )
         context.user_data["watch_config"] = asdict(config)
+        self._save_watch_config(config)
 
     def _remove_watch_job(self, context) -> bool:
         jobs = self._job_queue(context.application).get_jobs_by_name(self.watch_job_name)
         for job in jobs:
             job.schedule_removal()
         context.user_data.pop("watch_config", None)
+        self._delete_watch_config()
         return bool(jobs)
 
     def _get_watch_config(self, context) -> WatchConfig | None:
         payload = context.user_data.get("watch_config")
-        if not payload:
-            return None
-        return WatchConfig(**payload)
-
-    def _format_watch_status(self, config: WatchConfig) -> str:
-        return (
-            f"watching {config.symbol} {config.strategy_name} {config.interval}\n"
-            f"method={config.method} every={config.poll_seconds}s"
-        )
-
-    async def _run_ranking(self, update, context, rank_config: RankConfig):
-        self._store_rank_config(context, rank_config)
-        await update.message.reply_text("开始拉取数据并计算排名，请稍候。", reply_markup=self._reply_keyboard_remove())
-        rankings = self.research_service.rank_intervals(
-            symbol=rank_config.symbol,
-            strategy_name=rank_config.strategy_name,
-            method=rank_config.method,
-            intervals=rank_config.intervals,
-            lookback_hours=rank_config.lookback_hours,
-        )
-        await update.message.reply_text(
-            self.research_service.format_rankings(
-                symbol=rank_config.symbol,
-                strategy_name=rank_config.strategy_name,
-                method=rank_config.method,
-                lookback_hours=rank_config.lookback_hours,
-                rankings=rankings,
-            )
-        )
-        if rankings:
-            context.user_data["monitor_interval"] = rankings[0].interval
-            context.user_data["selected_parameters"] = rankings[0].best_parameters
-        return rankings
-
-    def _resolve_watch_top_rank_config(self, context) -> RankConfig:
-        existing = self._get_rank_config(context)
-        symbol = str(context.user_data.get("watch_top_symbol") or (existing.symbol if existing else self.research_service.default_symbol()))
-        if existing is not None:
-            return RankConfig(
-                symbol=symbol,
-                strategy_name=existing.strategy_name,
-                method=existing.method,
-                intervals=existing.intervals,
-                lookback_hours=existing.lookback_hours,
-            )
-        return RankConfig(
-            symbol=symbol,
-            strategy_name=self.research_service.default_strategy(),
-            method=self.research_service.default_method(),
-            intervals=self.research_service.default_ranking_intervals(),
-            lookback_hours=self.research_service.default_lookback_hours(),
-        )
-
-    def _store_rank_config(self, context, rank_config: RankConfig) -> None:
-        context.user_data["symbol"] = rank_config.symbol
-        context.user_data["strategy_name"] = rank_config.strategy_name
-        context.user_data["method"] = rank_config.method
-        context.user_data["intervals"] = rank_config.intervals
-        context.user_data["lookback_hours"] = rank_config.lookback_hours
-
-    def _get_rank_config(self, context) -> RankConfig | None:
-        if not context.user_data.get("symbol") or not context.user_data.get("strategy_name"):
-            return None
-        return RankConfig(
-            symbol=str(context.user_data["symbol"]),
-            strategy_name=str(context.user_data["strategy_name"]),
-            method=str(context.user_data.get("method", self.research_service.default_method())),
-            intervals=list(context.user_data.get("intervals", self.research_service.default_ranking_intervals())),
-            lookback_hours=int(context.user_data.get("lookback_hours", self.research_service.default_lookback_hours())),
-        )
+        if payload:
+            return WatchConfig(**payload)
+        # Fallback to redis
+        return self._load_watch_config()
 
     def _job_queue(self, application):
         if application.job_queue is None:
             raise RuntimeError("Telegram job queue is unavailable.")
         return application.job_queue
 
-    def _reply_keyboard_remove(self):
-        from telegram import ReplyKeyboardRemove
-
-        return ReplyKeyboardRemove()
-
     def _build_watch_callback(self):
         async def callback(context) -> None:
             config_data = context.job.data or {}
             config = WatchConfig(**config_data)
-            result = self.monitor_once_callback(
-                strategy_name=config.strategy_name,
-                symbol=config.symbol,
-                interval=config.interval,
-                method=config.method,
-            )
-            if result.notification_sent or result.actions:
-                await context.bot.send_message(chat_id=self.chat_id, text=self._format_monitor_result(result))
-
+            if self.monitor_once_callback_async is not None:
+                result = await self.monitor_once_callback_async(
+                    strategy_name=config.strategy_name,
+                    symbol=config.symbol,
+                    interval=config.interval,
+                    method=config.method,
+                    volume=context.application.bot_data.get("default_order_size", 1.0),
+                )
+            else:
+                result = self.monitor_once_callback(
+                    strategy_name=config.strategy_name,
+                    symbol=config.symbol,
+                    interval=config.interval,
+                    method=config.method,
+                    volume=context.application.bot_data.get("default_order_size", 1.0),
+                )
+            if result.actions:
+                await self._send_safe(context.job.context or self.chat_id, self._format_monitor_result(result))
         return callback

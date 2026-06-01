@@ -9,7 +9,7 @@ class FakeMarketApi:
     def __init__(self) -> None:
         self.calls: list[dict[str, str]] = []
 
-    def get_history_candlesticks(self, **kwargs):
+    def get_candlesticks(self, **kwargs):
         self.calls.append(kwargs)
         return {
             "code": "0",
@@ -36,9 +36,8 @@ def test_okx_history_client_uses_sdk_and_normalizes_30m_rows() -> None:
     assert market_api.calls == [
         {
             "instId": "XAUUSDT",
-            "before": "1735693200000",
             "bar": "30m",
-            "limit": "100",
+            "limit": "300",
         }
     ]
     assert len(rows) == 2
