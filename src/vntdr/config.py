@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Mapping
+from typing import Any, Mapping
 
 from dotenv import dotenv_values
 from pydantic import BaseModel, Field, SecretStr
@@ -77,13 +77,19 @@ class ResearchSettings(BaseModel):
     maker_fee_rate: float = 0.0002  # Maker 手续费率，默认 0.02%
     taker_fee_rate: float = 0.0005  # Taker 手续费率，默认 0.05%
     use_maker_fee: bool = False  # 是否使用 maker 费率（默认使用 taker）
+    optimize_target: str = "sharpe"  # 寻优打分排序指标，可选: sharpe (夏普比率) / return (收益率)
+    trade_mode: str = "both"  # 交易模式，可选: both (多空双开) / long_only (只算多仓) / short_only (只算空仓)
+    strategy_parameters: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    monitored_targets: list[dict[str, Any]] = Field(default_factory=lambda: [
+        {"strategy_name": "cm_macd_ult_mtf", "symbol": "XAU-USDT-SWAP", "interval": "4h", "volume": 1.0}
+    ])
 
 
 class RiskSettings(BaseModel):
     max_strategy_capital: float = Field(default=0.30, ge=0.0, le=1.0)
     max_total_exposure: float = Field(default=0.60, ge=0.0, le=1.0)
     max_drawdown: float = Field(default=0.02, ge=0.0, le=1.0)
-    allowed_symbols: list[str] = Field(default_factory=lambda: ["XAU-USDT-SWAP"])
+    allowed_symbols: list[str] = Field(default_factory=lambda: ["XAU-USDT-SWAP", "QQQ-USDT-SWAP", "BTC-USDT-SWAP", "ETH-USDT-SWAP"])
     max_order_size: float = Field(default=1.0, gt=0.0)
     allow_opening_trades: bool = True
 
@@ -152,6 +158,8 @@ class Settings(BaseModel):
                 maker_fee_rate=float(mapping.get("VNTDR_MAKER_FEE_RATE", "0.0002")),
                 taker_fee_rate=float(mapping.get("VNTDR_TAKER_FEE_RATE", "0.0005")),
                 use_maker_fee=_to_bool(mapping.get("VNTDR_USE_MAKER_FEE", "false")),
+                optimize_target=mapping.get("VNTDR_OPTIMIZE_TARGET", "sharpe"),
+                trade_mode=mapping.get("VNTDR_TRADE_MODE", "both"),
             ),
             risk=RiskSettings(
                 max_strategy_capital=float(mapping.get("VNTDR_MAX_STRATEGY_CAPITAL", "0.30")),
@@ -190,7 +198,8 @@ class Settings(BaseModel):
     def _validate_live(self) -> None:
         self._validate_database()
         if not self.telegram.bot_token or not self.telegram.chat_id:
-            raise ConfigurationError("Telegram credentials are required for live mode.")
+            import logging
+            logging.getLogger(__name__).warning("Telegram credentials are not configured. Live mode notifications will be disabled.")
 
 
 def _secret(value: str | None) -> SecretStr | None:

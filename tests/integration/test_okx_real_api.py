@@ -8,7 +8,7 @@ from __future__ import annotations
 import pytest
 
 from vntdr.config import Settings
-from vntdr.services.history import HistorySyncService
+from vntdr.services.history import HistorySyncService, OkxHistoryClient
 from vntdr.services.research import ResearchService
 from vntdr.services.telegram_research import TelegramResearchService
 from vntdr.storage.database import Database
@@ -46,12 +46,17 @@ def services(settings, sqlite_db):
     research_run_repo = ResearchRunRepository(sqlite_db)
     research_service = ResearchService(
         settings=settings,
-        market_data_repo=market_repo,
-        research_run_repo=research_run_repo,
+        market_data_repository=market_repo,
+        research_run_repository=research_run_repo,
     )
     history_service = HistorySyncService(
         settings=settings,
-        market_data_repo=market_repo,
+        history_client=OkxHistoryClient(
+            base_url=settings.okx.rest_base_url,
+            demo_trading=settings.okx.demo_trading,
+        ),
+        market_data_repository=market_repo,
+        research_run_repository=research_run_repo,
     )
     telegram_research = TelegramResearchService(
         settings=settings,
@@ -86,11 +91,12 @@ class TestOKXApiIntegration:
                 end = datetime.now(timezone.utc)
                 start = end - timedelta(hours=1)
 
-                result = history_service.fetch_candles(
+                result = history_service.history_client.fetch_candles(
                     symbol=symbol,
                     interval=interval,
                     start=start,
                     end=end,
+                    limit=10,
                 )
                 print(f"✓ interval='{interval}' 成功，获取了 {len(result)} 根 K 线")
                 # 只要不抛异常就是成功
@@ -109,7 +115,7 @@ class TestOKXApiIntegration:
         # 测试真实的排名流程
         symbol = "XAU-USDT-SWAP"
         strategy_name = "cm_macd_ult_mtf"
-        method = "grid"
+        method = "ga"
 
         # 使用默认的间隔和回看时间
         intervals = telegram_research.available_intervals()

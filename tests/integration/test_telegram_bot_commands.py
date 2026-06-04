@@ -28,7 +28,7 @@ class FakeRanking:
 class FakeResearchService:
     default_symbol_name: str = "XAU-USDT-SWAP"
     default_strategy_name: str = "cm_macd_ult_mtf"
-    default_method_name: str = "grid"
+    default_method_name: str = "ga"
 
     def default_symbol(self) -> str:
         return self.default_symbol_name
@@ -52,7 +52,7 @@ class FakeResearchService:
         return ["cm_macd_ult_mtf"]
 
     def available_methods(self) -> list[str]:
-        return ["grid", "ga"]
+        return ["ga"]
 
     def rank_intervals(
         self,
@@ -414,7 +414,7 @@ class TestTelegramBotCommands:
             symbol="XAU-USDT-SWAP",
             strategy_name="cm_macd_ult_mtf",
             interval="4h",
-            method="grid",
+            method="ga",
             poll_seconds=60,
         )
 

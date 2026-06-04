@@ -6,17 +6,17 @@ from vntdr.models import BarRecord
 from vntdr.strategies.base import ReviewedStrategyBase
 
 DEFAULT_PARAMETERS = {
-    "fast_length": 4,
-    "slow_length": 8,
+    "fast_length": 6,
+    "slow_length": 21,
     "signal_length": 3,
-    "trend_window": 3,
+    "trend_window": 7,
 }
 
 DEFAULT_PARAMETER_SPACE = {
-    "fast_length": [3, 4, 5],
-    "slow_length": [6, 7, 8, 9],
-    "signal_length": [3, 4],
-    "trend_window": [2, 3, 4],
+    "fast_length": [2, 4, 6, 8, 10, 12],
+    "slow_length": [10, 15, 20, 25, 30],
+    "signal_length": [3, 5, 7, 9],
+    "trend_window": [3, 5, 7, 9],
 }
 
 

@@ -25,7 +25,7 @@ class IntervalResearchResult:
 
 class TelegramResearchService:
     DEFAULT_INTERVALS = ("15m", "30m", "1h", "4h")
-    DEFAULT_METHODS = ("grid", "ga")
+    DEFAULT_METHODS = ("ga",)
     DEFAULT_LOOKBACK_HOURS = 24
 
     def __init__(

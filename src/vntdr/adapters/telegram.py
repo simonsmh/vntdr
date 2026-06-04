@@ -12,23 +12,23 @@ class TelegramNotifier:
         self.chat_id = chat_id
 
     def notify(self, message: str) -> None:
-        logger.info(f"Sending Telegram notification (MarkdownV2): {message}")
+        logger.info(f"Sending Telegram notification (HTML): {message}")
         try:
-            # 1. Try sending as MarkdownV2
+            # 1. Try sending as HTML
             response = httpx.post(
                 f"https://api.telegram.org/bot{self.bot_token}/sendMessage",
                 json={
                     "chat_id": self.chat_id, 
                     "text": message, 
-                    "parse_mode": "MarkdownV2"
+                    "parse_mode": "HTML"
                 },
                 timeout=20.0,
             )
             response.raise_for_status()
-            logger.debug("Telegram notification sent successfully as MarkdownV2")
+            logger.debug("Telegram notification sent successfully as HTML")
         except httpx.HTTPStatusError as e:
-            # 2. If MarkdownV2 fails (often due to unescaped special characters), fallback to plain text
-            logger.warning(f"Failed to send MarkdownV2 message: {e.response.text}. Retrying with plain text fallback.")
+            # 2. If HTML fails, fallback to plain text
+            logger.warning(f"Failed to send HTML message: {e.response.text}. Retrying with plain text fallback.")
             error_detail = ""
             try:
                 err_json = e.response.json()
@@ -36,12 +36,13 @@ class TelegramNotifier:
             except:
                 pass
             
-            # Clean text for fallback: strip common markdown markers
-            clean_text = message.replace("*", "").replace("`", "")
+            # Clean text for fallback: strip HTML tags
+            import re
+            clean_text = re.sub(r'<[^>]+>', '', message)
             
             fallback_text = (
                 f"{clean_text}\n\n"
-                f"⚠️ 该消息 Markdown 格式 Telegram 解析失败，已转为纯文本。请检查特殊字符并重试。"
+                f"⚠️ 该消息 HTML 格式 Telegram 解析失败，已转为纯文本。请检查特殊字符并重试。"
                 f"{error_detail}"
             )
             

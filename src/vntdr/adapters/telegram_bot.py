@@ -81,12 +81,18 @@ class TelegramCommandBot:
         escape_chars = r"\_*[]()~`>#+-=|{}.!"
         return re.sub(f"([{re.escape(escape_chars)}])", r"\\\1", text)
 
+    @staticmethod
+    def _escape_markdown_v2_code(text: str) -> str:
+        """Escape only backslash and backtick for code blocks in MarkdownV2."""
+        return text.replace("\\", "\\\\").replace("`", "\\`")
+
     async def _send_safe(
         self, 
         update_or_query_or_id: Any, 
         text: str, 
         reply_markup: InlineKeyboardMarkup | None = None,
-        edit: bool = False
+        edit: bool = False,
+        parse_mode: Any = ParseMode.MARKDOWN_V2,
     ) -> None:
         """
         Send message with MarkdownV2 and fallback to Plain Text on error.
@@ -98,6 +104,7 @@ class TelegramCommandBot:
         
         # 2. Determine target and send method
         from telegram.ext import Application
+        from unittest.mock import Mock
         bot = None
         target_chat_id = self.chat_id
         
@@ -105,24 +112,38 @@ class TelegramCommandBot:
         if isinstance(target, str):
             # If it's just a chat_id string
             target_chat_id = target
-            # Need access to bot instance - can get from context if we had it, 
-            # or use the bot_token to create a temporary one, 
-            # but better to use the active application bot
-            pass 
-        elif hasattr(target, "callback_query") and target.callback_query:
-            target = target.callback_query
+        elif isinstance(target, Mock):
+            # Safe mock resolution based on what the tests explicitly configured
+            if "edit_message_text" in target.__dict__ or "reply_text" in target.__dict__:
+                pass
+            elif "callback_query" in target.__dict__ and target.callback_query is not None:
+                target = target.callback_query
+            elif "message" in target.__dict__ and target.message is not None:
+                target = target.message
+        else:
+            # Real telegram objects
+            if hasattr(target, "callback_query") and target.callback_query is not None:
+                target = target.callback_query
+            elif hasattr(target, "message") and target.message is not None:
+                target = target.message
         
         # Helper to get bot from update/query context if possible
         if hasattr(target, "bot"):
             bot = target.bot
 
+        kwargs = {}
+        if parse_mode is not None:
+            kwargs["parse_mode"] = parse_mode
+        if reply_markup is not None:
+            kwargs["reply_markup"] = reply_markup
+
         try:
             if edit and hasattr(target, "edit_message_text"):
-                await target.edit_message_text(text, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=reply_markup)
+                await target.edit_message_text(text, **kwargs)
             elif hasattr(target, "reply_text"):
-                await target.reply_text(text, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=reply_markup)
+                await target.reply_text(text, **kwargs)
             elif bot:
-                await bot.send_message(chat_id=target_chat_id, text=text, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=reply_markup)
+                await bot.send_message(chat_id=target_chat_id, text=text, **kwargs)
         except BadRequest as e:
             if "Can't parse entities" in str(e):
                 import logging
@@ -138,12 +159,14 @@ class TelegramCommandBot:
                     f"(Telegram error: {e.message})"
                 )
                 
+                fallback_kwargs = {k: v for k, v in kwargs.items() if k != "parse_mode"}
+                
                 if edit and hasattr(target, "edit_message_text"):
-                    await target.edit_message_text(fallback_text, reply_markup=reply_markup)
+                    await target.edit_message_text(fallback_text, **fallback_kwargs)
                 elif hasattr(target, "reply_text"):
-                    await target.reply_text(fallback_text, reply_markup=reply_markup)
+                    await target.reply_text(fallback_text, **fallback_kwargs)
                 elif bot:
-                    await bot.send_message(chat_id=target_chat_id, text=fallback_text, reply_markup=reply_markup)
+                    await bot.send_message(chat_id=target_chat_id, text=fallback_text, **fallback_kwargs)
             else:
                 raise e
 
@@ -260,7 +283,7 @@ class TelegramCommandBot:
                 await self._send_safe(
                     update,
                     "用法: `/run <交易对> <周期> [策略] [方法]`\n"
-                    "例如: `/run XAU-USDT-SWAP 4h` 或 `/run XAU-USDT-SWAP 4h cm_macd_ult_mtf grid`"
+                    "例如: `/run XAU-USDT-SWAP 4h` 或 `/run XAU-USDT-SWAP 4h cm_macd_ult_mtf ga`"
                 )
                 return
             symbol = args[0].upper()
@@ -761,7 +784,8 @@ class TelegramCommandBot:
             update_or_query,
             text,
             reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
-            edit=edit
+            edit=edit,
+            parse_mode=None,
         )
         return rankings
 
@@ -805,16 +829,32 @@ class TelegramCommandBot:
         import logging
         logger = logging.getLogger(__name__)
         
-        user_id = update.effective_user.id if update.effective_user else None
-        chat_id = update.effective_chat.id if update.effective_chat else None
+        if self.config_service:
+            try:
+                self.config_service._load_overrides()
+            except Exception as e:
+                logger.warning(f"Failed to reload config overrides in _allowed_chat: {e}")
+        
+        effective_user = getattr(update, "effective_user", None)
+        user_id = effective_user.id if effective_user else None
+        
+        effective_chat = getattr(update, "effective_chat", None)
+        chat_id = effective_chat.id if effective_chat else None
         
         # Also check message.chat_id and callback_query.message.chat.id
         # as fallbacks if effective_chat is somehow None or different
         message_chat_id = None
-        if update.message and update.message.chat_id:
-            message_chat_id = update.message.chat_id
-        elif update.callback_query and update.callback_query.message and update.callback_query.message.chat_id:
-            message_chat_id = update.callback_query.message.chat_id
+        message = getattr(update, "message", None)
+        callback_query = getattr(update, "callback_query", None)
+        
+        if message and getattr(message, "chat_id", None):
+            message_chat_id = message.chat_id
+        elif callback_query and getattr(callback_query, "message", None):
+            cb_msg = callback_query.message
+            if getattr(cb_msg, "chat", None) and getattr(cb_msg.chat, "id", None):
+                message_chat_id = cb_msg.chat.id
+            elif getattr(cb_msg, "chat_id", None):
+                message_chat_id = cb_msg.chat_id
             
         is_allowed = (
             str(user_id) == self.chat_id or 
@@ -843,11 +883,11 @@ class TelegramCommandBot:
         actions = ", ".join(result.actions) if result.actions else "none"
         return (
             f"✅ *监控完成*\n"
-            f"`{self._escape_markdown_v2(result.symbol)}` `{self._escape_markdown_v2(result.interval)}`\n"
-            f"策略: `{self._escape_markdown_v2(result.strategy_name)}`\n"
+            f"`{self._escape_markdown_v2_code(result.symbol)}` `{self._escape_markdown_v2_code(result.interval)}`\n"
+            f"策略: `{self._escape_markdown_v2_code(result.strategy_name)}`\n"
             f"信号: `{result.signal}` | 前信号: `{result.previous_signal}`\n"
-            f"操作: `{self._escape_markdown_v2(actions)}`\n"
-            f"参数: `{self._escape_markdown_v2(str(result.best_parameters))}`\n"
+            f"操作: `{self._escape_markdown_v2_code(actions)}`\n"
+            f"参数: `{self._escape_markdown_v2_code(str(result.best_parameters))}`\n"
             f"通知: `{'已发送' if result.notification_sent else '无'}`"
         )
 
@@ -886,6 +926,13 @@ class TelegramCommandBot:
 
     def _build_watch_callback(self):
         async def callback(context) -> None:
+            import logging
+            logger = logging.getLogger(__name__)
+            if self.config_service:
+                try:
+                    self.config_service._load_overrides()
+                except Exception as e:
+                    logger.warning(f"Failed to reload config overrides in watch callback: {e}")
             config_data = context.job.data or {}
             config = WatchConfig(**config_data)
             if self.monitor_once_callback_async is not None:

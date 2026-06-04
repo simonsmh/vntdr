@@ -56,6 +56,7 @@ def test_monitoring_reverses_from_long_to_short_and_notifies(
             "TG_CHAT_ID": "chat-id",
             "VNTDR_DATABASE_URL": f"sqlite+pysqlite:///{db_path}",
             "VNTDR_REPORT_DIR": str(tmp_path / "reports"),
+            "VNTDR_ALLOWED_SYMBOLS": "XAUUSDT",
         }
     )
     research_service = ResearchService(

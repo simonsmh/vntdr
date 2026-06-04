@@ -33,7 +33,7 @@ class SimulatedOrderExecutor:
     async def execute_async(self, instructions: list[OrderInstruction]) -> list[OrderInstruction]:
         return self.execute(instructions)
 
-    def get_current_positions(self, inst_type: str = "SWAP") -> list[dict[str, Any]]:
+    def get_current_positions(self, symbol: str | None = None) -> list[dict[str, Any]]:
         return []
 
     async def get_current_positions_async(self, symbol: str | None = None) -> list[dict[str, Any]]:

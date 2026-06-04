@@ -107,9 +107,9 @@ class MonitoringService:
         strategy_name: str,
         symbol: str,
         interval: str,
-        parameter_space: dict[str, list[Any]],
+        parameter_space: dict[str, list[Any]] | None = None,
         volume: float,
-        method: str = "grid",
+        method: str = "ga",
         lookback_bars: int = 120,
     ) -> MonitorResult:
         cache_key = f"signal:{symbol}:{interval}:{strategy_name}"
@@ -121,6 +121,32 @@ class MonitoringService:
         bars = self.market_data_repository.fetch_latest_bars(symbol, interval, limit=lookback_bars)
         if not bars:
             raise ValueError("No bars available for monitoring.")
+
+        # Exclude the last bar if it is currently incomplete (still forming)
+        # to prevent repaint / flashing signals from incomplete candles.
+        is_last_incomplete = False
+        incomplete_bar = None
+        completed_bars = list(bars)
+        full_bars = list(bars)
+        
+        if bars:
+            last_bar = bars[-1]
+            interval_lower = last_bar.interval.lower()
+            from vntdr.cleaning import INTERVAL_TO_DELTA
+            delta = INTERVAL_TO_DELTA.get(interval_lower)
+            if delta:
+                from datetime import datetime, timezone
+                bar_dt = last_bar.datetime
+                if bar_dt.tzinfo is None:
+                    bar_dt = bar_dt.replace(tzinfo=timezone.utc)
+                now_utc = datetime.now(timezone.utc)
+                if now_utc < bar_dt + delta:
+                    is_last_incomplete = True
+                    incomplete_bar = last_bar
+                    completed_bars = bars[:-1]
+
+        if not completed_bars:
+            raise ValueError("No completed bars available for monitoring.")
 
         # Update current account equity for drawdown checks
         self.update_account_info()
@@ -134,57 +160,103 @@ class MonitoringService:
                     self.signal_store.set(cache_key, previous_signal)
             except Exception as e:
                 logger.warning(f"Reconciliation failed (API issues): {e}. Falling back to monitoring-only mode.")
-                # We don't raise error here, just let previous_signal stay None
-                # or we can treat it as 0 to start detecting changes from now.
 
+        # Parameter optimization on completed bars only for stability
         if parameter_space:
             best_parameters, _metrics, _ = self.research_service.optimize_parameters(
                 strategy_name=strategy_name,
-                bars=bars,
+                bars=completed_bars,
                 parameter_space=parameter_space,
                 method=method,
+                optimize_target=getattr(self.research_service.settings.research, "optimize_target", "sharpe"),
             )
         else:
             best_parameters = self.research_service.default_parameters(strategy_name)
 
-        signal = self.research_service.latest_signal(
+        # 1. Confirmed Signal
+        confirmed_signal = self.research_service.latest_signal(
             strategy_name=strategy_name,
-            bars=bars,
+            bars=completed_bars,
             parameters=best_parameters,
         )
+        
+        # 2. Potential Signal (Incomplete candle)
+        potential_signal = confirmed_signal
+        if is_last_incomplete:
+            potential_signal = self.research_service.latest_signal(
+                strategy_name=strategy_name,
+                bars=full_bars,
+                parameters=best_parameters,
+            )
+
         self.risk_manager.validate_symbol(symbol)
         
-        # Build instructions (even if we might not execute them, we need them for the notification)
+        # Build instructions on confirmed_signal
         instructions = self.risk_manager.filter_instructions(
-            self._build_instructions(symbol, previous_signal, signal, volume),
+            self._build_instructions(symbol, previous_signal, confirmed_signal, volume),
             previous_signal=previous_signal,
-            next_signal=signal,
+            next_signal=confirmed_signal,
         )
         
-        # Determine if we should notify
-        # If previous_signal is None, we treat it as 0 for change detection to avoid missing the first signal
+        # Determine if we should notify confirmed signal changes
         effective_prev = 0 if previous_signal is None else previous_signal
-        should_notify = (signal != last_notified and effective_prev != signal)
+        should_notify_confirmed = (confirmed_signal != last_notified and effective_prev != confirmed_signal)
         
         notification_sent = False
-        if should_notify:
+        if should_notify_confirmed:
             message = self._build_message(
                 symbol=symbol,
                 interval=interval,
                 strategy_name=strategy_name,
-                signal=signal,
+                signal=confirmed_signal,
                 previous_signal=previous_signal,
                 parameters=best_parameters,
                 actions=[instruction.action for instruction in instructions],
             )
             try:
                 self.notifier.notify(message)
-                self.signal_store.set(notify_cache_key, signal)
+                self.signal_store.set(notify_cache_key, confirmed_signal)
                 notification_sent = True
             except Exception as e:
-                logger.error(f"Failed to send notification: {e}")
+                logger.error(f"Failed to send confirmation notification: {e}")
 
-        # Try to execute orders
+        # Send Potential Alert if there is an unconfirmed signal change
+        if is_last_incomplete and potential_signal != confirmed_signal:
+            potential_cache_key = f"potential_notify:{symbol}:{interval}:{strategy_name}:{incomplete_bar.datetime.isoformat()}"
+            last_notified_potential = self.signal_store.get(potential_cache_key)
+            
+            if potential_signal != last_notified_potential:
+                from datetime import datetime, timezone
+                bar_dt = incomplete_bar.datetime
+                if bar_dt.tzinfo is None:
+                    bar_dt = bar_dt.replace(tzinfo=timezone.utc)
+                now_utc = datetime.now(timezone.utc)
+                remaining_sec = max(0, int(((bar_dt + delta) - now_utc).total_seconds()))
+                h = remaining_sec // 3600
+                m = (remaining_sec % 3600) // 60
+                s = remaining_sec % 60
+                remaining_str = f"{h}小时{m}分" if h > 0 else f"{m}分{s}秒"
+                
+                alert_message = self._build_potential_alert_message(
+                    symbol=symbol,
+                    interval=interval,
+                    strategy_name=strategy_name,
+                    confirmed_signal=confirmed_signal,
+                    potential_signal=potential_signal,
+                    remaining_str=remaining_str,
+                )
+                try:
+                    self.notifier.notify(alert_message)
+                    self.signal_store.set(potential_cache_key, potential_signal)
+                    if hasattr(self.signal_store, "client"):
+                        try:
+                            self.signal_store.client.expire(potential_cache_key, 172800)
+                        except Exception:
+                            pass
+                except Exception as e:
+                    logger.error(f"Failed to send potential alert: {e}")
+
+        # Try to execute orders on confirmed_signal
         execution_error = None
         if instructions:
             try:
@@ -192,17 +264,41 @@ class MonitoringService:
             except Exception as e:
                 execution_error = str(e)
                 logger.error(f"Order execution failed: {e}")
-                # We DO NOT return early. We want to finish the monitoring cycle.
 
-        # CRITICAL: Always update the current signal in cache to prevent notification loops,
-        # even if the order execution failed. 
-        self.signal_store.set(cache_key, signal)
+        # CRITICAL: Always update the current confirmed signal in cache to prevent confirmation loops
+        self.signal_store.set(cache_key, confirmed_signal)
+
+        # Update dynamic monitoring status & log history in Redis for Gradio Dashboard
+        if hasattr(self.signal_store, "client"):
+            try:
+                import json
+                from datetime import datetime, timezone
+                status_entry = {
+                    "time": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                    "strategy_name": strategy_name,
+                    "symbol": symbol,
+                    "interval": interval,
+                    "signal": confirmed_signal,
+                    "previous_signal": previous_signal,
+                    "best_parameters": best_parameters,
+                    "actions": [instruction.action for instruction in instructions],
+                    "notification_sent": notification_sent,
+                    "error": execution_error,
+                    "heartbeat": datetime.now(timezone.utc).timestamp()
+                }
+                serialized = json.dumps(status_entry, ensure_ascii=False)
+                self.signal_store.client.set("vntdr:live_status", serialized)
+                self.signal_store.client.hset("vntdr:live_statuses", f"{symbol}:{interval}:{strategy_name}", serialized)
+                self.signal_store.client.lpush("vntdr:live_logs", serialized)
+                self.signal_store.client.ltrim("vntdr:live_logs", 0, 99)
+            except Exception as e:
+                logger.warning(f"Failed to save live status/log to Redis: {e}")
         
         return MonitorResult(
             symbol=symbol,
             interval=interval,
             strategy_name=strategy_name,
-            signal=signal,
+            signal=confirmed_signal,
             previous_signal=previous_signal,
             best_parameters=best_parameters,
             actions=[instruction.action for instruction in instructions],
@@ -216,9 +312,9 @@ class MonitoringService:
         strategy_name: str,
         symbol: str,
         interval: str,
-        parameter_space: dict[str, list[Any]],
+        parameter_space: dict[str, list[Any]] | None = None,
         volume: float,
-        method: str = "grid",
+        method: str = "ga",
         lookback_bars: int = 120,
     ) -> MonitorResult:
         return await asyncio.get_event_loop().run_in_executor(
@@ -279,6 +375,8 @@ class MonitoringService:
         parameters: dict[str, Any],
         actions: list[str],
     ) -> str:
+        from html import escape
+        
         signal_map = {
             1: "🔵 LONG (看涨)",
             -1: "🔴 SHORT (看跌)",
@@ -295,13 +393,17 @@ class MonitoringService:
         drawdown = self.risk_manager.get_current_drawdown()
         drawdown_str = f"{drawdown:.2%}" if drawdown is not None else "N/A"
         
+        esc_strategy = escape(strategy_name)
+        esc_symbol = escape(symbol)
+        esc_interval = escape(interval)
+        
         action_text = "\n".join([f"  • {action_map.get(a, a)}" for a in actions]) if actions else "  无操作"
         
-        params_text = "\n".join([f"  • {k}: {v}" for k, v in parameters.items()])
+        params_text = "\n".join([f"  • {escape(str(k))}: {escape(str(v))}" for k, v in parameters.items()])
         
-        return f"""📊 **交易信号更新**
-策略: `{strategy_name}`
-交易对: `{symbol} {interval}`
+        return f"""📊 <b>交易信号更新</b>
+策略: <code>{esc_strategy}</code>
+交易对: <code>{esc_symbol} {esc_interval}</code>
 
 🔄 信号变化:
   之前: {signal_map.get(previous_signal, f'{previous_signal}')}
@@ -314,4 +416,39 @@ class MonitoringService:
 {params_text}
 
 📉 当前最大回撤: {drawdown_str}
+"""
+
+    def _build_potential_alert_message(
+        self,
+        *,
+        symbol: str,
+        interval: str,
+        strategy_name: str,
+        confirmed_signal: int,
+        potential_signal: int,
+        remaining_str: str,
+    ) -> str:
+        from html import escape
+        
+        signal_map = {
+            1: "🔵 LONG (看涨)",
+            -1: "🔴 SHORT (看跌)",
+            0: "⚪ 空仓",
+            None: "❓ 未知",
+        }
+        
+        esc_strategy = escape(strategy_name)
+        esc_symbol = escape(symbol)
+        esc_interval = escape(interval)
+        
+        return f"""🔔 <b>盘中信号预警 (未收盘/仅供参考)</b>
+策略: <code>{esc_strategy}</code>
+交易对: <code>{esc_symbol} {esc_interval}</code>
+
+🔄 预警变化:
+  当前持仓状态: {signal_map.get(confirmed_signal, f'{confirmed_signal}')}
+  盘中潜在新信号: {signal_map.get(potential_signal, f'{potential_signal}')}
+
+⏳ 距离收盘还有: <b>{remaining_str}</b>
+⚠️ <i>注意：盘中价格波动频繁，该信号尚未确认，系统暂未执行任何下单操作。实际下单将在收盘时以最终收盘价为准。</i>
 """

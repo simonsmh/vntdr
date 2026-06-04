@@ -20,11 +20,17 @@ class ConfigService:
         "research.maker_fee_rate": "💵 Maker 手续费率",
         "research.taker_fee_rate": "💵 Taker 手续费率",
         "research.use_maker_fee": "⚡ 使用 Maker 费率",
+        "research.optimize_target": "🎯 寻优打分排序指标",
+        "research.trade_mode": "🔄 交易模式 (多空/仅多/仅空)",
         "risk.max_strategy_capital": "🛡️ 单策略最大资金",
         "risk.max_total_exposure": "🛡️ 最大总敞口",
         "risk.max_drawdown": "📉 最大回撤限制",
         "risk.max_order_size": "📦 最大下单量",
         "risk.allow_opening_trades": "✅ 允许开仓",
+        "okx.api_key": "🔑 OKX API Key",
+        "okx.secret_key": "🔑 OKX Secret Key",
+        "okx.passphrase": "🔑 OKX Passphrase",
+        "okx.demo_trading": "⚡ OKX 模拟交易",
     }
 
     def __init__(self, settings: Settings, config_file: Path | None = None):
@@ -54,22 +60,42 @@ class ConfigService:
         for key, value in self._overrides.items():
             self._set_setting(key, value, persist=False)
 
+    def _is_secret_field(self, model: Any, field_name: str) -> bool:
+        from pydantic import SecretStr
+        if not hasattr(model, "model_fields"):
+            return False
+        field_info = model.model_fields.get(field_name)
+        if not field_info:
+            return False
+        ann = field_info.annotation
+        if ann is SecretStr:
+            return True
+        if hasattr(ann, "__args__"):
+            return any(arg is SecretStr for arg in ann.__args__)
+        return False
+
     def _set_setting(self, key: str, value: Any, persist: bool = True) -> None:
         """设置单个配置项"""
-        # 解析嵌套的 key，例如 "research.maker_fee_rate"
+        from pydantic import SecretStr
+        # 解析嵌套 of key，例如 "research.maker_fee_rate"
         parts = key.split(".")
         if len(parts) == 1:
             # 顶级配置
             if hasattr(self.settings, parts[0]):
+                if self._is_secret_field(self.settings, parts[0]) and not isinstance(value, SecretStr):
+                    value = SecretStr(value) if value else None
                 setattr(self.settings, parts[0], value)
         elif len(parts) == 2:
             # 嵌套配置，如 research.maker_fee_rate
             section = getattr(self.settings, parts[0], None)
             if section is not None and hasattr(section, parts[1]):
+                if self._is_secret_field(section, parts[1]) and not isinstance(value, SecretStr):
+                    value = SecretStr(value) if value else None
                 setattr(section, parts[1], value)
 
         if persist:
-            self._overrides[key] = value
+            persist_value = value.get_secret_value() if isinstance(value, SecretStr) else value
+            self._overrides[key] = persist_value
             self._save_overrides()
 
     def get(self, key: str) -> Any:
@@ -117,6 +143,10 @@ class ConfigService:
         """列出所有可配置项"""
         result = {}
 
+        # OKX 配置
+        for key in ["api_key", "secret_key", "passphrase", "demo_trading"]:
+            result[f"okx.{key}"] = getattr(self.settings.okx, key)
+
         # Research 配置
         for key in [
             "default_strategy",
@@ -127,6 +157,8 @@ class ConfigService:
             "maker_fee_rate",
             "taker_fee_rate",
             "use_maker_fee",
+            "optimize_target",
+            "trade_mode",
         ]:
             result[f"research.{key}"] = getattr(self.settings.research, key)
 

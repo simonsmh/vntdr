@@ -22,7 +22,7 @@ class StubResearchService:
         assert strategy_name == "cm_macd_ult_mtf"
         return {"fast_length": [3, 4], "slow_length": [6, 7]}
 
-    def optimize(self, config: ResearchJobConfig, method: str = "grid") -> ResearchReport:
+    def optimize(self, config: ResearchJobConfig, method: str = "ga") -> ResearchReport:
         self.calls.append((config, method))
         total_return = {"15m": 0.12, "30m": 0.08, "1h": 0.15}[config.interval]
         return ResearchReport(
@@ -50,7 +50,7 @@ def test_rank_intervals_sorts_by_total_return(env_map: dict[str, str]) -> None:
     rankings = service.rank_intervals(
         symbol="XAUUSDT",
         strategy_name="cm_macd_ult_mtf",
-        method="grid",
+        method="ga",
         intervals=["15m", "30m", "1h"],
         lookback_hours=24,
     )
@@ -69,12 +69,12 @@ def test_format_rankings_includes_symbol_and_parameters(env_map: dict[str, str])
     message = service.format_rankings(
         symbol="XAUUSDT",
         strategy_name="cm_macd_ult_mtf",
-        method="grid",
+        method="ga",
         lookback_hours=24,
         rankings=service.rank_intervals(
             symbol="XAUUSDT",
             strategy_name="cm_macd_ult_mtf",
-            method="grid",
+            method="ga",
             intervals=["15m"],
             lookback_hours=24,
         ),

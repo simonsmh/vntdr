@@ -16,7 +16,7 @@ class DummyResearchService:
         return "cm_macd_ult_mtf"
 
     def default_method(self) -> str:
-        return "grid"
+        return "ga"
 
     def default_ranking_intervals(self) -> list[str]:
         return ["15m", "30m", "1h", "4h"]
@@ -31,7 +31,7 @@ class DummyResearchService:
         return ["cm_macd_ult_mtf"]
 
     def available_methods(self) -> list[str]:
-        return ["grid", "ga"]
+        return ["ga"]
 
     def rank_intervals(self, **kwargs) -> list:
         return []
@@ -80,7 +80,7 @@ def test_format_watch_status_includes_poll_seconds() -> None:
         symbol="XAUUSDT",
         strategy_name="cm_macd_ult_mtf",
         interval="15m",
-        method="grid",
+        method="ga",
         poll_seconds=60,
     )
 
@@ -106,7 +106,7 @@ def test_watch_config_creation() -> None:
         symbol="XAU-USDT-SWAP",
         strategy_name="cm_macd_ult_mtf",
         interval="4h",
-        method="grid",
+        method="ga",
         poll_seconds=120,
     )
     assert config.poll_seconds == 120
@@ -185,7 +185,7 @@ async def test_execute_rank_sends_without_markdown_mode() -> None:
     config = RankConfig(
         symbol="XAU-USDT-SWAP",
         strategy_name="cm_macd_ult_mtf",
-        method="grid",
+        method="ga",
         intervals=["15m"],
         lookback_hours=24,
     )

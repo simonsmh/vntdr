@@ -9,14 +9,15 @@ class FakeMarketApi:
     def __init__(self) -> None:
         self.calls: list[dict[str, str]] = []
 
-    def get_candlesticks(self, **kwargs):
+    def get_history_candlesticks(self, **kwargs):
         self.calls.append(kwargs)
         return {
             "code": "0",
             "data": [
-                ["1735691400000", "101", "103", "100", "102", "12", "0", "0", "1"],
-                ["1735693200000", "102", "104", "101", "103", "13", "0", "0", "1"],
                 ["1735696800000", "103", "105", "102", "104", "14", "0", "0", "1"],
+                ["1735693200000", "102", "104", "101", "103", "13", "0", "0", "1"],
+                ["1735691400000", "101", "103", "100", "102", "12", "0", "0", "1"],
+                ["1735687800000", "100", "102", "99", "101", "11", "0", "0", "1"],
             ],
         }
 
@@ -33,13 +34,13 @@ def test_okx_history_client_uses_sdk_and_normalizes_30m_rows() -> None:
         limit=100,
     )
 
-    assert market_api.calls == [
-        {
-            "instId": "XAUUSDT",
-            "bar": "30m",
-            "limit": "300",
-        }
-    ]
+    assert len(market_api.calls) == 1
+    assert market_api.calls[0]["instId"] == "XAUUSDT"
+    assert market_api.calls[0]["bar"] == "30m"
+    assert market_api.calls[0]["limit"] == "100"
+    # Ensure after parameter is set to end timestamp (1735693200000) + 1000ms = 1735693201000
+    assert market_api.calls[0]["after"] == "1735693201000"
+
     assert len(rows) == 2
     assert rows[0]["interval"] == "30m"
     assert rows[0]["close"] == 102.0

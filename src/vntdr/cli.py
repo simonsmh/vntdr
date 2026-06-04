@@ -130,8 +130,8 @@ class CommandContext:
         volume: float,
         parameter_space: dict[str, list[Any]] | None = None,
     ) -> MonitorResult:
-        if parameter_space is None:
-            parameter_space = self.research_service.default_parameter_space(strategy_name)
+        from vntdr.services.config_service import ConfigService
+        ConfigService(self.settings)._load_overrides()
         return self.monitoring_service.monitor_once(
             strategy_name=strategy_name,
             symbol=symbol,
@@ -152,8 +152,8 @@ class CommandContext:
         volume: float,
         parameter_space: dict[str, list[Any]] | None = None,
     ) -> MonitorResult:
-        if parameter_space is None:
-            parameter_space = self.research_service.default_parameter_space(strategy_name)
+        from vntdr.services.config_service import ConfigService
+        ConfigService(self.settings)._load_overrides()
         return await self.monitoring_service.monitor_once_async(
             strategy_name=strategy_name,
             symbol=symbol,
@@ -273,7 +273,7 @@ def optimize_command(
     interval: str = typer.Option(...),
     start: str = typer.Option(..., "--from"),
     end: str = typer.Option(..., "--to"),
-    method: str = typer.Option("grid"),
+    method: str = typer.Option("ga"),
     lookback_values: str = typer.Option("2,3,4"),
 ) -> None:
     settings = Settings.from_env()
@@ -326,6 +326,49 @@ def walk_forward_command(
     typer.echo(report.to_markdown())
 
 
+def sync_target_market_data(context, sym, inv, logger) -> None:
+    try:
+        from datetime import datetime, timedelta, timezone
+        now_dt = datetime.now(timezone.utc).replace(tzinfo=None)
+        
+        # Check database for latest bar time
+        latest_bars = context.market_data_repository.fetch_latest_bars(sym, inv, limit=1)
+        
+        if latest_bars:
+            latest_time = latest_bars[-1].datetime
+            if latest_time.tzinfo is not None:
+                latest_time = latest_time.replace(tzinfo=None)
+            # If the latest bar in the DB is very fresh (e.g. less than 10 seconds old), skip sync
+            if now_dt - latest_time < timedelta(seconds=10):
+                logger.info(f"Data is already fresh for {sym} ({inv}), skipping sync.")
+                return
+            
+            # OKX historical candles endpoint works best if start is slightly before the latest time to handle potential overlaps safely
+            start_dt = latest_time - timedelta(minutes=5)
+        else:
+            inv_lower = inv.lower()
+            if "m" in inv_lower:
+                days = 3
+            elif "h" in inv_lower:
+                days = 25 if "4h" in inv_lower else 8
+            elif "d" in inv_lower:
+                days = 150
+            else:
+                days = 10
+            start_dt = now_dt - timedelta(days=days)
+            
+        logger.info(f"Auto-syncing data for {sym} ({inv}) from {start_dt} to {now_dt} (incremental)")
+        context.history_service.sync(
+            symbol=sym,
+            interval=inv,
+            start=start_dt,
+            end=now_dt,
+            fill_missing=False,
+        )
+    except Exception as sync_err:
+        logger.warning(f"Auto-sync failed for {sym} ({inv}): {sync_err}. Proceeding with local DB data.")
+
+
 @app.command("live")
 def live_command(
     once: bool = typer.Option(False, help="Run a single dependency probe and exit."),
@@ -333,7 +376,7 @@ def live_command(
     strategy: str | None = typer.Option(None),
     symbol: str | None = typer.Option(None),
     interval: str | None = typer.Option(None),
-    method: str = typer.Option("grid"),
+    method: str = typer.Option("ga"),
 ) -> None:
     import logging
     logger = logging.getLogger(__name__)
@@ -355,43 +398,91 @@ def live_command(
     selected_symbol = symbol or settings.research.default_symbol
     selected_interval = interval or settings.research.default_interval
 
-    # Reconcile positions from OKX API on startup
-    cache_key = f"signal:{selected_symbol}:{selected_interval}:{selected_strategy}"
-    # Get existing signal from Redis
-    redis_client = redis.from_url(settings.redis.url)
-    existing_signal = context.monitoring_service.signal_store.get(cache_key)
-    
-    if existing_signal is None:
-        logger.info(f"No existing signal found in Redis, reconciling from OKX API positions")
-        try:
-            reconciled_signal = context.monitoring_service.reconcile_positions(symbol=selected_symbol)
-            if reconciled_signal is not None:
-                context.monitoring_service.signal_store.set(cache_key, reconciled_signal)
-                logger.info(f"Reconciled signal {reconciled_signal} saved to cache")
-            else:
-                logger.info("No open positions found on OKX, starting fresh")
-        except Exception as e:
-            logger.error(f"Failed to reconcile positions from OKX: {e}, starting with empty position", exc_info=True)
-            # Don't crash - proceed with monitoring assuming no position
-            pass
-    else:
-        logger.info(f"Found existing signal {existing_signal} in Redis, skipping reconciliation")
+    # Reconcile positions from OKX API for all monitored targets at startup
+    config_service._load_overrides()
+    targets = getattr(settings.research, "monitored_targets", None)
+    if not targets:
+        targets = [{
+            "strategy_name": selected_strategy,
+            "symbol": selected_symbol,
+            "interval": selected_interval,
+            "volume": settings.research.default_order_size
+        }]
+
+    for tgt in targets:
+        s_name = tgt.get("strategy_name", selected_strategy)
+        sym = tgt.get("symbol", selected_symbol)
+        inv = tgt.get("interval", selected_interval)
+        
+        cache_key = f"signal:{sym}:{inv}:{s_name}"
+        # Get existing signal from Redis
+        existing_signal = context.monitoring_service.signal_store.get(cache_key)
+        
+        if existing_signal is None:
+            logger.info(f"No existing signal found in Redis for {sym} ({inv}), reconciling from OKX API positions")
+            try:
+                reconciled_signal = context.monitoring_service.reconcile_positions(symbol=sym)
+                if reconciled_signal is not None:
+                    context.monitoring_service.signal_store.set(cache_key, reconciled_signal)
+                    logger.info(f"Reconciled signal {reconciled_signal} saved to cache for {sym}")
+                else:
+                    logger.info(f"No open positions found on OKX for {sym}, starting fresh")
+            except Exception as e:
+                logger.error(f"Failed to reconcile positions from OKX for {sym}: {e}, starting with empty position")
+        else:
+            logger.info(f"Found existing signal {existing_signal} in Redis for {sym} ({inv}), skipping reconciliation")
+
+    # Create a local ThreadPoolExecutor for concurrent sync and monitoring of targets
+    # Limit max workers to avoid excessive concurrent connection limits
+    executor = ThreadPoolExecutor(max_workers=min(len(targets), 4))
 
     def run_monitor_once() -> None:
-        monitor_result = context.monitor_once(
-            strategy_name=selected_strategy,
-            symbol=selected_symbol,
-            interval=selected_interval,
-            method=method,
-            volume=settings.research.default_order_size,
-        )
-        typer.echo(
-            f"monitor strategy={monitor_result.strategy_name} symbol={monitor_result.symbol} "
-            f"interval={monitor_result.interval} signal={monitor_result.signal} "
-            f"actions={monitor_result.actions} parameters={monitor_result.best_parameters}"
-        )
+        config_service._load_overrides()
+        loop_targets = getattr(settings.research, "monitored_targets", None)
+        if not loop_targets:
+            loop_targets = [{
+                "strategy_name": selected_strategy,
+                "symbol": selected_symbol,
+                "interval": selected_interval,
+                "volume": settings.research.default_order_size
+            }]
 
-    run_monitor_once()
+        futures = []
+        for tgt in loop_targets:
+            s_name = tgt.get("strategy_name", selected_strategy)
+            sym = tgt.get("symbol", selected_symbol)
+            inv = tgt.get("interval", selected_interval)
+            vol = tgt.get("volume", settings.research.default_order_size)
+
+            def target_task(s_name=s_name, sym=sym, inv=inv, vol=vol):
+                # 1. Incremental Sync
+                sync_target_market_data(context, sym, inv, logger)
+                # 2. Run Monitor
+                return context.monitor_once(
+                    strategy_name=s_name,
+                    symbol=sym,
+                    interval=inv,
+                    method=method,
+                    volume=vol,
+                )
+
+            futures.append(executor.submit(target_task))
+
+        for future in futures:
+            try:
+                res = future.result()
+                typer.echo(
+                    f"monitor strategy={res.strategy_name} symbol={res.symbol} "
+                    f"interval={res.interval} signal={res.signal} "
+                    f"actions={res.actions} parameters={res.best_parameters}"
+                )
+            except Exception as e:
+                logger.error(f"Async monitor task failed: {e}")
+
+    try:
+        run_monitor_once()
+    except Exception as e:
+        logger.warning(f"Initial monitor run failed (no data yet?): {e}")
     if once:
         raise typer.Exit(code=0)
     
@@ -430,7 +521,15 @@ def live_command(
         try:
             # Refresh settings/overrides each loop to pick up changes from /config
             config_service._load_overrides()
+            current_strategy = config_service.get("research.default_strategy")
+            current_symbol = config_service.get("research.default_symbol")
             current_interval = config_service.get("research.default_interval")
+            if current_strategy != selected_strategy:
+                logger.info(f"Main loop detected strategy change: {selected_strategy} -> {current_strategy}")
+                selected_strategy = current_strategy
+            if current_symbol != selected_symbol:
+                logger.info(f"Main loop detected symbol change: {selected_symbol} -> {current_symbol}")
+                selected_symbol = current_symbol
             if current_interval != selected_interval:
                 logger.info(f"Main loop detected interval change: {selected_interval} -> {current_interval}")
                 selected_interval = current_interval
@@ -446,10 +545,20 @@ def live_command(
             backoff = min(base_backoff * (2 ** error_count), max_backoff)
             logger.exception(f"Error in monitoring loop (error count: {error_count}), backing off for {backoff} seconds")
             if error_count >= 5:
+                import html
+                escaped_e = html.escape(str(e))
                 context.monitoring_service.notifier.notify(
-                    f"⚠️ Monitoring experiencing repeated errors: {e}\nBacking off for {backoff} seconds"
+                    f"⚠️ Monitoring experiencing repeated errors: {escaped_e}\nBacking off for {backoff} seconds"
                 )
             time.sleep(backoff)
+
+
+@app.command("gradio")
+def gradio_command(
+    port: int = typer.Option(7860, help="Port to listen on"),
+) -> None:
+    from vntdr.webapp import main as run_webapp
+    run_webapp(port=port)
 
 
 @app.command("telegram-bot")

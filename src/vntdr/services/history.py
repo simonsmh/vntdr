@@ -49,46 +49,73 @@ class OkxHistoryClient:
         end: datetime,
         limit: int,
     ) -> list[dict[str, Any]]:
+        import time
         all_rows: list[dict[str, Any]] = []
         
-        # Use get_candlesticks instead of get_history_candlesticks
-        # It returns the latest candles directly
         # OKX requires bar in uppercase for hours: 1h -> 1H, 4h -> 4H
         okx_bar = interval.upper() if interval.endswith(('h', 'H')) else interval
-        response = self.market_api.get_candlesticks(
-            instId=symbol,
-            bar=okx_bar,
-            limit=str(300),  # Get maximum possible in one request
-        )
-        if response.get("code") != "0":
-            raise RuntimeError(f"OKX SDK error: {response}")
         
-        rows = response.get("data", [])
-        if not rows:
-            return all_rows
-            
-        for row in rows:
-            timestamp_ms, open_price, high_price, low_price, close_price, volume, *_ = row
-            candle_time = datetime.fromtimestamp(int(timestamp_ms) / 1000, tz=timezone.utc)
-            # Make start and end timezone-aware for comparison
-            start_utc = start.astimezone(timezone.utc)
-            end_utc = end.astimezone(timezone.utc)
-            if candle_time < start_utc or candle_time > end_utc:
-                continue
-            all_rows.append(
-                {
-                    "symbol": symbol,
-                    "exchange": "OKX",
-                    "interval": interval,
-                    "datetime": candle_time.isoformat(),
-                    "open": float(open_price),
-                    "high": float(high_price),
-                    "low": float(low_price),
-                    "close": float(close_price),
-                    "volume": float(volume),
-                }
+        # Convert start and end to timezone-aware UTC
+        start_utc = start.astimezone(timezone.utc)
+        end_utc = end.astimezone(timezone.utc)
+        
+        # We will page backward using the after parameter
+        # OKX candles are returned sorted from newest to oldest
+        current_after = int(end_utc.timestamp() * 1000) + 1000 # Add 1s buffer
+        
+        while True:
+            response = self.market_api.get_history_candlesticks(
+                instId=symbol,
+                bar=okx_bar,
+                after=str(current_after),
+                limit=str(100),
             )
+            if response.get("code") != "0":
+                raise RuntimeError(f"OKX SDK error: {response}")
+                
+            rows = response.get("data", [])
+            if not rows:
+                break
+                
+            oldest_ts = None
+            has_reached_start = False
             
+            for row in rows:
+                timestamp_ms, open_price, high_price, low_price, close_price, volume, *_ = row
+                ts_val = int(timestamp_ms)
+                candle_time = datetime.fromtimestamp(ts_val / 1000, tz=timezone.utc)
+                
+                if oldest_ts is None or ts_val < oldest_ts:
+                    oldest_ts = ts_val
+                    
+                if candle_time < start_utc:
+                    has_reached_start = True
+                    continue
+                    
+                if candle_time > end_utc:
+                    continue
+                    
+                all_rows.append(
+                    {
+                        "symbol": symbol,
+                        "exchange": "OKX",
+                        "interval": interval,
+                        "datetime": candle_time.isoformat(),
+                        "open": float(open_price),
+                        "high": float(high_price),
+                        "low": float(low_price),
+                        "close": float(close_price),
+                        "volume": float(volume),
+                    }
+                )
+                
+            if has_reached_start or oldest_ts is None or oldest_ts >= current_after:
+                break
+                
+            current_after = oldest_ts
+            time.sleep(0.1) # Avoid hitting OKX API rate limits (20 req / 2s)
+            
+        all_rows.sort(key=lambda x: x["datetime"])
         return all_rows
 
     async def fetch_candles_async(

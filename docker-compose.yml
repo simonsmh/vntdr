@@ -50,12 +50,31 @@ services:
     volumes:
       - vntrader_data:/app/.vntrader
       - reports_data:/app/reports
+      - config_data:/root/.vntdr
     command: ["vntdr", "live"]
     healthcheck:
       test: ["CMD", "vntdr", "doctor"]
       interval: 30s
       timeout: 10s
       retries: 3
+    networks:
+      - quant_net
+
+  webapp:
+    image: ghcr.io/simonsmh/vntdr:latest
+    restart: always
+    env_file:
+      - stack.env
+    depends_on:
+      db:
+        condition: service_healthy
+      cache:
+        condition: service_healthy
+    ports:
+      - "7860:7860"
+    command: ["vntdr", "gradio"]
+    volumes:
+      - config_data:/root/.vntdr
     networks:
       - quant_net
 
@@ -68,3 +87,4 @@ volumes:
   redis_data:
   vntrader_data:
   reports_data:
+  config_data:

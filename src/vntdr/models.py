@@ -109,10 +109,12 @@ class ResearchJobConfig(BaseModel):
     start: datetime
     end: datetime
     mode: Literal["backtest", "optimize", "walk-forward"] = "backtest"
+    method: str = "ga"
     parameters: dict[str, Any] = Field(default_factory=dict)
     parameter_space: dict[str, list[Any]] = Field(default_factory=dict)
     train_window: int | None = None
     test_window: int | None = None
+    optimize_target: str = "sharpe"
 
     @field_validator("start", "end")
     @classmethod
