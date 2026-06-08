@@ -80,9 +80,7 @@ class ResearchSettings(BaseModel):
     optimize_target: str = "sharpe"  # 寻优打分排序指标，可选: sharpe (夏普比率) / return (收益率)
     trade_mode: str = "both"  # 交易模式，可选: both (多空双开) / long_only (只算多仓) / short_only (只算空仓)
     strategy_parameters: dict[str, dict[str, Any]] = Field(default_factory=dict)
-    monitored_targets: list[dict[str, Any]] = Field(default_factory=lambda: [
-        {"strategy_name": "cm_macd_ult_mtf", "symbol": "XAU-USDT-SWAP", "interval": "4h", "volume": 1.0}
-    ])
+    monitored_targets: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class RiskSettings(BaseModel):

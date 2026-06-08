@@ -402,17 +402,26 @@ def live_command(
     config_service._load_overrides()
     targets = getattr(settings.research, "monitored_targets", None)
     if not targets:
-        targets = [{
-            "strategy_name": selected_strategy,
-            "symbol": selected_symbol,
-            "interval": selected_interval,
-            "volume": settings.research.default_order_size
-        }]
+        if strategy or symbol or interval:
+            selected_strategy = strategy or settings.research.default_strategy
+            selected_symbol = symbol or settings.research.default_symbol
+            selected_interval = interval or settings.research.default_interval
+            targets = [{
+                "strategy_name": selected_strategy,
+                "symbol": selected_symbol,
+                "interval": selected_interval,
+                "volume": settings.research.default_order_size
+            }]
+        else:
+            targets = []
+
+    if not targets:
+        logger.warning("No monitored targets configured. Please add monitored targets through the Web UI or config override file.")
 
     for tgt in targets:
-        s_name = tgt.get("strategy_name", selected_strategy)
-        sym = tgt.get("symbol", selected_symbol)
-        inv = tgt.get("interval", selected_interval)
+        s_name = tgt.get("strategy_name", strategy or settings.research.default_strategy)
+        sym = tgt.get("symbol", symbol or settings.research.default_symbol)
+        inv = tgt.get("interval", interval or settings.research.default_interval)
         
         cache_key = f"signal:{sym}:{inv}:{s_name}"
         # Get existing signal from Redis
@@ -434,24 +443,30 @@ def live_command(
 
     # Create a local ThreadPoolExecutor for concurrent sync and monitoring of targets
     # Limit max workers to avoid excessive concurrent connection limits
-    executor = ThreadPoolExecutor(max_workers=min(len(targets), 4))
+    executor = ThreadPoolExecutor(max_workers=max(min(len(targets), 4), 1))
 
     def run_monitor_once() -> None:
         config_service._load_overrides()
         loop_targets = getattr(settings.research, "monitored_targets", None)
         if not loop_targets:
-            loop_targets = [{
-                "strategy_name": selected_strategy,
-                "symbol": selected_symbol,
-                "interval": selected_interval,
-                "volume": settings.research.default_order_size
-            }]
+            if strategy or symbol or interval:
+                selected_strategy = strategy or settings.research.default_strategy
+                selected_symbol = symbol or settings.research.default_symbol
+                selected_interval = interval or settings.research.default_interval
+                loop_targets = [{
+                    "strategy_name": selected_strategy,
+                    "symbol": selected_symbol,
+                    "interval": selected_interval,
+                    "volume": settings.research.default_order_size
+                }]
+            else:
+                loop_targets = []
 
         futures = []
         for tgt in loop_targets:
-            s_name = tgt.get("strategy_name", selected_strategy)
-            sym = tgt.get("symbol", selected_symbol)
-            inv = tgt.get("interval", selected_interval)
+            s_name = tgt.get("strategy_name", strategy or settings.research.default_strategy)
+            sym = tgt.get("symbol", symbol or settings.research.default_symbol)
+            inv = tgt.get("interval", interval or settings.research.default_interval)
             vol = tgt.get("volume", settings.research.default_order_size)
 
             def target_task(s_name=s_name, sym=sym, inv=inv, vol=vol):
