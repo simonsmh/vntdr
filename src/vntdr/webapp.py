@@ -564,6 +564,7 @@ def main(port: int = 7860) -> None:
                                 lines=5,
                             )
                             opt_run_btn = gr.Button("⚡ 运行参数寻优", variant="primary")
+                            opt_apply_best_btn = gr.Button("🎯 将最优参数填入回测", variant="secondary")
                             opt_status = gr.Textbox(label="寻优状态", interactive=False)
 
                         with gr.Accordion("🏁 样本外走查测试 (Walk-forward)", open=False):
@@ -1499,6 +1500,23 @@ def main(port: int = 7860) -> None:
             apply_opt_params,
             inputs=[global_strategy, opt_select_combo, opt_top_results, opt_best_params],
             outputs=[opt_status, bt_params_lookback, bt_params_macd, visual_tabs, global_strategy],
+        )
+
+        def apply_best_params_direct(strategy_name, best_params):
+            if not best_params:
+                return "未找到最优参数，请先运行寻优", gr.update(), gr.update()
+            
+            formatted = "\n".join(f"{k}={v}" for k, v in best_params.items())
+            
+            if strategy_name == "demo_momentum":
+                return "最优参数已填入回测面板", formatted, gr.update()
+            else:
+                return "最优参数已填入回测面板", gr.update(), formatted
+
+        opt_apply_best_btn.click(
+            apply_best_params_direct,
+            inputs=[global_strategy, opt_best_params],
+            outputs=[opt_status, bt_params_lookback, bt_params_macd],
         )
 
         def run_walk_forward_dispatch(
