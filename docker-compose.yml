@@ -41,7 +41,7 @@ services:
     image: ghcr.io/simonsmh/vntdr:latest
     restart: always
     env_file:
-      - stack.env
+      - .env
     depends_on:
       db:
         condition: service_healthy
@@ -64,7 +64,7 @@ services:
     image: ghcr.io/simonsmh/vntdr:latest
     restart: always
     env_file:
-      - stack.env
+      - .env
     depends_on:
       db:
         condition: service_healthy

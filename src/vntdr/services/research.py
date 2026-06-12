@@ -320,7 +320,144 @@ class ResearchService:
         method: str = "ga",
         optimize_target: str = "sharpe",
     ) -> list[tuple[dict[str, Any], dict[str, float]]]:
-        return self._run_genetic_search(bars, strategy_name, parameter_space, optimize_target)
+        m = str(method).lower().strip()
+        
+        # Calculate total combinations
+        total_combinations = math.prod(len(v) for v in parameter_space.values()) if parameter_space else 0
+        if total_combinations <= 1000:
+            m = "grid"
+
+        if m == "grid":
+            return self._run_grid_search(bars, strategy_name, parameter_space, optimize_target)
+        elif m in ("heuristic", "bfs", "astar"):
+            return self._run_heuristic_search(bars, strategy_name, parameter_space, optimize_target)
+        else:
+            return self._run_genetic_search(bars, strategy_name, parameter_space, optimize_target)
+
+    def _run_grid_search(
+        self,
+        bars: list[BarRecord],
+        strategy_name: str,
+        parameter_space: dict[str, list[Any]],
+        optimize_target: str = "sharpe",
+    ) -> list[tuple[dict[str, Any], dict[str, float]]]:
+        keys = list(parameter_space.keys())
+        value_lists = [parameter_space[k] for k in keys]
+        combinations = list(itertools.product(*value_lists))
+        
+        evaluations = []
+        for combo in combinations:
+            params = dict(zip(keys, combo, strict=True))
+            outcome = self._execute_backtest(bars, strategy_name, params)
+            evaluations.append((params, outcome.metrics))
+            
+        return sorted(
+            evaluations,
+            key=lambda item: (
+                -999.0 if item[1].get("trade_count", 0) == 0 else item[1].get("total_return", 0.0),
+                -999.0 if item[1].get("trade_count", 0) == 0 else item[1].get("sharpe_ratio", 0.0)
+            )
+            if optimize_target == "return"
+            else (
+                -999.0 if item[1].get("trade_count", 0) == 0 else item[1].get("sharpe_ratio", 0.0),
+                -999.0 if item[1].get("trade_count", 0) == 0 else item[1].get("total_return", 0.0)
+            ),
+            reverse=True
+        )
+
+    def _run_heuristic_search(
+        self,
+        bars: list[BarRecord],
+        strategy_name: str,
+        parameter_space: dict[str, list[Any]],
+        optimize_target: str = "sharpe",
+        max_evaluations: int = 100,
+    ) -> list[tuple[dict[str, Any], dict[str, float]]]:
+        """A*-inspired Heuristic graph search over parameter grid."""
+        import heapq
+        
+        local_random = random.Random(42)
+        keys = list(parameter_space.keys())
+        dim_lengths = [len(parameter_space[k]) for k in keys]
+        
+        def node_to_params(node: tuple[int, ...]) -> dict[str, Any]:
+            return {keys[i]: parameter_space[keys[i]][node[i]] for i in range(len(keys))}
+            
+        evaluations: dict[tuple[int, ...], tuple[dict[str, Any], dict[str, float]]] = {}
+        
+        def evaluate_node(node: tuple[int, ...]) -> float:
+            if node in evaluations:
+                _, metrics = evaluations[node]
+            else:
+                params = node_to_params(node)
+                outcome = self._execute_backtest(bars, strategy_name, params)
+                metrics = outcome.metrics
+                evaluations[node] = (params, metrics)
+                
+            if metrics.get("trade_count", 0) == 0:
+                return -999.0
+            if optimize_target == "return":
+                return metrics.get("total_return", 0.0)
+            else:
+                return metrics.get("sharpe_ratio", 0.0)
+
+        # Seeds: Center of parameter grid + a few random points
+        center_node = tuple(length // 2 for length in dim_lengths)
+        seeds = {center_node}
+        
+        # Add up to 3 random seeds to avoid getting stuck in local optima
+        num_random_seeds = min(3, math.prod(dim_lengths) - 1)
+        while len(seeds) < num_random_seeds + 1:
+            rand_node = tuple(local_random.randint(0, length - 1) for length in dim_lengths)
+            seeds.add(rand_node)
+            
+        open_set = []
+        visited = set()
+        
+        for seed in seeds:
+            score = evaluate_node(seed)
+            heapq.heappush(open_set, (-score, seed))
+            visited.add(seed)
+            
+        eval_count = len(seeds)
+        
+        while open_set and eval_count < max_evaluations:
+            neg_score, current = heapq.heappop(open_set)
+            
+            # Generate neighbors (step +/-1 in each dimension)
+            neighbors = []
+            for dim in range(len(keys)):
+                for delta in (-1, 1):
+                    neighbor = list(current)
+                    neighbor[dim] += delta
+                    if 0 <= neighbor[dim] < dim_lengths[dim]:
+                        neighbors.append(tuple(neighbor))
+                        
+            for neighbor in neighbors:
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    score = evaluate_node(neighbor)
+                    eval_count += 1
+                    
+                    # Push with priority as -score
+                    heapq.heappush(open_set, (-score, neighbor))
+                    
+                    if eval_count >= max_evaluations:
+                        break
+                        
+        return sorted(
+            evaluations.values(),
+            key=lambda item: (
+                -999.0 if item[1].get("trade_count", 0) == 0 else item[1].get("total_return", 0.0),
+                -999.0 if item[1].get("trade_count", 0) == 0 else item[1].get("sharpe_ratio", 0.0)
+            )
+            if optimize_target == "return"
+            else (
+                -999.0 if item[1].get("trade_count", 0) == 0 else item[1].get("sharpe_ratio", 0.0),
+                -999.0 if item[1].get("trade_count", 0) == 0 else item[1].get("total_return", 0.0)
+            ),
+            reverse=True
+        )
 
     def _run_genetic_search(
         self,

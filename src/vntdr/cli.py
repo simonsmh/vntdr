@@ -247,7 +247,6 @@ def backtest_command(
     interval: str = typer.Option(...),
     start: str = typer.Option(..., "--from"),
     end: str = typer.Option(..., "--to"),
-    lookback: int = typer.Option(3),
 ) -> None:
     settings = Settings.from_env()
     settings.validate_for("backtest")
@@ -260,7 +259,7 @@ def backtest_command(
             start=start,
             end=end,
             mode="backtest",
-            parameters={"lookback": lookback},
+            parameters=context.research_service.default_parameters(strategy),
         )
     )
     typer.echo(report.to_markdown())
@@ -274,12 +273,10 @@ def optimize_command(
     start: str = typer.Option(..., "--from"),
     end: str = typer.Option(..., "--to"),
     method: str = typer.Option("ga"),
-    lookback_values: str = typer.Option("2,3,4"),
 ) -> None:
     settings = Settings.from_env()
     settings.validate_for("optimize")
     context = create_command_context(settings)
-    values = [int(value.strip()) for value in lookback_values.split(",") if value.strip()]
     report = context.optimize(
         _build_research_config(
             strategy=strategy,
@@ -288,7 +285,7 @@ def optimize_command(
             start=start,
             end=end,
             mode="optimize",
-            parameter_space={"lookback": values},
+            parameter_space=context.research_service.default_parameter_space(strategy),
         ),
         method=method,
     )
@@ -304,12 +301,10 @@ def walk_forward_command(
     end: str = typer.Option(..., "--to"),
     train_window: int = typer.Option(...),
     test_window: int = typer.Option(...),
-    lookback_values: str = typer.Option("2,3,4"),
 ) -> None:
     settings = Settings.from_env()
     settings.validate_for("walk-forward")
     context = create_command_context(settings)
-    values = [int(value.strip()) for value in lookback_values.split(",") if value.strip()]
     report = context.walk_forward(
         _build_research_config(
             strategy=strategy,
@@ -318,7 +313,7 @@ def walk_forward_command(
             start=start,
             end=end,
             mode="walk-forward",
-            parameter_space={"lookback": values},
+            parameter_space=context.research_service.default_parameter_space(strategy),
             train_window=train_window,
             test_window=test_window,
         )

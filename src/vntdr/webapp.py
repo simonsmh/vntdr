@@ -555,9 +555,15 @@ def main(port: int = 7860) -> None:
                             bt_status = gr.Textbox(label="回测状态", interactive=False)
 
                         with gr.Accordion("⚡ 辅助调参寻优 (Parameter Optimization)", open=False):
-                            opt_auto_fit = gr.Checkbox(
-                                label="自动范围拟合", value=False,
-                            )
+                            with gr.Row():
+                                opt_method = gr.Dropdown(
+                                    label="寻优算法",
+                                    choices=[("遗传算法 (GA)", "ga"), ("网格搜索 (Grid Search)", "grid"), ("A* 启发式搜索 (Heuristic)", "heuristic")],
+                                    value="heuristic",
+                                )
+                                opt_auto_fit = gr.Checkbox(
+                                    label="自动范围拟合", value=False,
+                                )
                             opt_space = gr.Textbox(
                                 label="参数搜索空间（每行 key=val1,val2,val3）",
                                 value=_default_space_text("cm_macd_ult_mtf"),
@@ -571,7 +577,13 @@ def main(port: int = 7860) -> None:
                             with gr.Row():
                                 wf_train = gr.Number(label="训练窗口 (K线数)", value=60, precision=0)
                                 wf_test  = gr.Number(label="测试窗口 (K线数)", value=20, precision=0)
-                            wf_auto_fit = gr.Checkbox(label="走查自动范围拟合", value=False)
+                            with gr.Row():
+                                wf_method = gr.Dropdown(
+                                    label="寻优算法",
+                                    choices=[("遗传算法 (GA)", "ga"), ("网格搜索 (Grid Search)", "grid"), ("A* 启发式搜索 (Heuristic)", "heuristic")],
+                                    value="heuristic",
+                                )
+                                wf_auto_fit = gr.Checkbox(label="走查自动范围拟合", value=False)
                             wf_run_btn = gr.Button("🏁 运行走查回测", variant="primary")
                             wf_status = gr.Textbox(label="走查状态", interactive=False)
 
@@ -827,13 +839,12 @@ def main(port: int = 7860) -> None:
             except Exception as e:
                 return f"错误：{e}", None, None, None, None
 
-        def run_optimize(strategy_name, symbol, interval, start, end, space_text, auto_fit):
+        def run_optimize(strategy_name, symbol, interval, start, end, space_text, auto_fit, method):
             try:
                 ctx, _, _ = _get_services()
                 if not start or not end:
                     return "请先输入日期", None, None, None, {}
                 
-                method = "ga"
                 if auto_fit:
                     bounds = STRATEGY_PARAMS.get(strategy_name, {}).get("bounds", {})
                     parameter_space = {k: _parse_space_value(v) for k, v in bounds.items()}
@@ -874,14 +885,12 @@ def main(port: int = 7860) -> None:
 
         def run_walk_forward(
             strategy_name, symbol, interval, start, end,
-            space_text, train_window, test_window, auto_fit,
+            space_text, train_window, test_window, auto_fit, method,
         ):
             try:
                 ctx, _, _ = _get_services()
                 if not start or not end:
                     return "请先输入日期", None, None, None, None, None
-                
-                method = "ga"
                 
                 if auto_fit:
                     bounds = STRATEGY_PARAMS.get(strategy_name, {}).get("bounds", {})
@@ -1449,9 +1458,9 @@ def main(port: int = 7860) -> None:
             outputs=[live_health, live_config, live_account, live_positions, live_logs_table]
         )
 
-        def run_optimize_dispatch(strategy_name, symbol, interval, start, end, space_text, auto_fit):
+        def run_optimize_dispatch(strategy_name, symbol, interval, start, end, space_text, auto_fit, method):
             status, metrics, params, top_table, best_params, top_results = run_optimize(
-                strategy_name, symbol, interval, start, end, space_text, auto_fit
+                strategy_name, symbol, interval, start, end, space_text, auto_fit, method
             )
             choices = []
             if top_results:
@@ -1472,7 +1481,7 @@ def main(port: int = 7860) -> None:
 
         opt_run_btn.click(
             run_optimize_dispatch,
-            inputs=[global_strategy, global_symbol, global_interval, global_start, global_end, opt_space, opt_auto_fit],
+            inputs=[global_strategy, global_symbol, global_interval, global_start, global_end, opt_space, opt_auto_fit, opt_method],
             outputs=[opt_status, opt_metrics_table, opt_params_table, opt_top_table, opt_best_params, opt_top_results, opt_select_combo, visual_tabs],
         )
 
@@ -1521,11 +1530,11 @@ def main(port: int = 7860) -> None:
 
         def run_walk_forward_dispatch(
             strategy_name, symbol, interval, start, end,
-            space_text, train_window, test_window, auto_fit,
+            space_text, train_window, test_window, auto_fit, method,
         ):
             status, metrics, params_df, folds_df, fig, trades_df = run_walk_forward(
                 strategy_name, symbol, interval, start, end,
-                space_text, train_window, test_window, auto_fit,
+                space_text, train_window, test_window, auto_fit, method,
             )
             return status, metrics, params_df, folds_df, fig, trades_df, gr.update(selected="visual_walk_forward")
 
@@ -1533,7 +1542,7 @@ def main(port: int = 7860) -> None:
             run_walk_forward_dispatch,
             inputs=[
                 global_strategy, global_symbol, global_interval, global_start, global_end,
-                opt_space, wf_train, wf_test, wf_auto_fit,
+                opt_space, wf_train, wf_test, wf_auto_fit, wf_method,
             ],
             outputs=[wf_status, wf_metrics_table, wf_params_table, wf_folds_table, wf_folds_plot, wf_trades_table, visual_tabs],
         )
