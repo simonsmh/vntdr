@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 from typer.testing import CliRunner
 
+from vntdr.config import Settings
 from vntdr.cli import app
+from vntdr.cli import CommandContext
 from vntdr.models import HealthCheckResult, MonitorResult, SyncResult
+from vntdr.services.config_service import ConfigService
 
 runner = CliRunner()
 
@@ -127,3 +132,47 @@ def test_live_once_reports_signal_and_actions(monkeypatch, env_map: dict[str, st
     assert result.exit_code == 0
     assert "signal=-1" in result.stdout
     assert "sell_short" in result.stdout
+
+
+def test_command_context_hot_reloads_okx_runtime_clients(tmp_path, env_map: dict[str, str]) -> None:
+    settings = Settings.from_mapping(
+        {
+            **env_map,
+            "OKX_API_KEY": "old-key",
+            "OKX_SECRET_KEY": "old-secret",
+            "OKX_PASSPHRASE": "old-passphrase",
+            "OKX_DEMO_TRADING": "true",
+        }
+    )
+    context = CommandContext.__new__(CommandContext)
+    context.settings = settings
+    context.monitoring_service = SimpleNamespace(order_executor="old-order")
+    context.history_service = SimpleNamespace(history_client="old-history")
+    context._runtime_config_lock = threading.Lock()
+    context._okx_runtime_signature = context._okx_runtime_config_signature(settings)
+
+    built_orders: list[str] = []
+    built_history: list[str] = []
+
+    def build_order(updated_settings: Settings) -> str:
+        value = updated_settings.okx.api_key.get_secret_value()
+        built_orders.append(value)
+        return f"order:{value}"
+
+    def build_history(updated_settings: Settings) -> str:
+        value = f"history:{updated_settings.okx.demo_trading}"
+        built_history.append(value)
+        return value
+
+    context._build_order_executor = build_order
+    context._build_history_client = build_history
+    config_service = ConfigService(settings, config_file=tmp_path / "config_override.json")
+    config_service.set("okx.api_key", "new-key")
+
+    context.refresh_runtime_config(config_service)
+    context.refresh_runtime_config(config_service)
+
+    assert context.monitoring_service.order_executor == "order:new-key"
+    assert context.history_service.history_client == "history:True"
+    assert built_orders == ["new-key"]
+    assert built_history == ["history:True"]

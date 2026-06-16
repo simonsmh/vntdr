@@ -92,4 +92,71 @@ def test_monitoring_reverses_from_long_to_short_and_notifies(
     assert result.signal == -1
     assert executor.actions == ["sell_long", "sell_short"]
     assert notifier.messages and "XAUUSDT" in notifier.messages[0]
+    lines = notifier.messages[0].splitlines()
+    assert "XAUUSDT 4h SHORT @" in lines[0]
+    assert "动作:" in lines[1]
+    assert "平多 + 开空" in lines[1]
+    assert "信号: LONG → SHORT" in lines[2]
     assert state_store.get("signal:XAUUSDT:4h:cm_macd_ult_mtf") == -1
+
+
+def test_monitoring_processes_each_closed_bar_only_once(
+    tmp_path,
+    env_map: dict[str, str],
+    sample_xau_bar_payloads: list[dict[str, object]],
+) -> None:
+    db_path = tmp_path / "research.sqlite3"
+    database = Database(f"sqlite+pysqlite:///{db_path}")
+    database.create_schema()
+    market_repo = MarketDataRepository(database)
+    market_repo.upsert_bars_from_payloads(sample_xau_bar_payloads)
+
+    settings = Settings.from_mapping(
+        {
+            **env_map,
+            "TG_BOT_TOKEN": "bot-token",
+            "TG_CHAT_ID": "chat-id",
+            "VNTDR_DATABASE_URL": f"sqlite+pysqlite:///{db_path}",
+            "VNTDR_REPORT_DIR": str(tmp_path / "reports"),
+            "VNTDR_ALLOWED_SYMBOLS": "XAUUSDT",
+        }
+    )
+    research_service = ResearchService(
+        settings=settings,
+        market_data_repository=market_repo,
+        research_run_repository=ResearchRunRepository(database),
+    )
+    notifier = FakeNotifier()
+    executor = FakeExecutor()
+    state_store = MemorySignalStore({"signal:XAUUSDT:4h:cm_macd_ult_mtf": 1})
+    service = MonitoringService(
+        research_service=research_service,
+        market_data_repository=market_repo,
+        notifier=notifier,
+        order_executor=executor,
+        signal_store=state_store,
+        risk_manager=RiskManager(settings.risk),
+    )
+
+    kwargs = {
+        "strategy_name": "cm_macd_ult_mtf",
+        "symbol": "XAUUSDT",
+        "interval": "4h",
+        "parameter_space": {
+            "fast_length": [3, 4],
+            "slow_length": [6, 7],
+            "signal_length": [3],
+            "trend_window": [2, 3],
+        },
+        "volume": 1.0,
+    }
+
+    first = service.monitor_once(**kwargs)
+    second = service.monitor_once(**kwargs)
+
+    assert first.notification_sent is True
+    assert first.actions == ["sell_long", "sell_short"]
+    assert second.notification_sent is False
+    assert second.actions == []
+    assert executor.actions == ["sell_long", "sell_short"]
+    assert len(notifier.messages) == 1

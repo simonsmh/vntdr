@@ -33,12 +33,11 @@ class CommandContext:
         self.database.create_schema()
         self.market_data_repository = MarketDataRepository(self.database)
         self.research_run_repository = ResearchRunRepository(self.database)
+        import threading
+        self._runtime_config_lock = threading.Lock()
         self.history_service = HistorySyncService(
             settings=settings,
-            history_client=OkxHistoryClient(
-                base_url=settings.okx.rest_base_url,
-                demo_trading=settings.okx.demo_trading,
-            ),
+            history_client=self._build_history_client(settings),
             market_data_repository=self.market_data_repository,
             research_run_repository=self.research_run_repository,
         )
@@ -48,6 +47,7 @@ class CommandContext:
             research_run_repository=self.research_run_repository,
         )
         redis_client = redis.from_url(settings.redis.url)
+        order_executor = self._build_order_executor(settings)
         self.monitoring_service = MonitoringService(
             research_service=self.research_service,
             market_data_repository=self.market_data_repository,
@@ -55,14 +55,21 @@ class CommandContext:
                 bot_token=settings.telegram.bot_token.get_secret_value() if settings.telegram.bot_token else "",
                 chat_id=settings.telegram.chat_id or "",
             ),
-            order_executor=self._build_order_executor(settings),
+            order_executor=order_executor,
             signal_store=RedisSignalStore(redis_client),
             risk_manager=RiskManager(settings.risk),
         )
+        self._okx_runtime_signature = self._okx_runtime_config_signature(settings)
         self.telegram_research_service = TelegramResearchService(
             settings=settings,
             history_service=self.history_service,
             research_service=self.research_service,
+        )
+
+    def _build_history_client(self, settings: Settings) -> OkxHistoryClient:
+        return OkxHistoryClient(
+            base_url=settings.okx.rest_base_url,
+            demo_trading=settings.okx.demo_trading,
         )
 
     def _build_order_executor(self, settings: Settings):
@@ -75,7 +82,44 @@ class CommandContext:
             demo_trading=settings.okx.demo_trading,
             margin_mode=settings.okx.margin_mode,
             order_type=settings.okx.order_type,
+            order_retry_count=settings.okx.order_retry_count,
+            order_retry_wait_seconds=settings.okx.order_retry_wait_seconds,
         )
+
+    def _okx_runtime_config_signature(self, settings: Settings) -> tuple[Any, ...]:
+        return (
+            settings.okx.api_key.get_secret_value() if settings.okx.api_key else "",
+            settings.okx.secret_key.get_secret_value() if settings.okx.secret_key else "",
+            settings.okx.passphrase.get_secret_value() if settings.okx.passphrase else "",
+            settings.okx.demo_trading,
+            settings.okx.rest_base_url,
+            settings.okx.margin_mode,
+            settings.okx.order_type,
+            settings.okx.order_retry_count,
+            settings.okx.order_retry_wait_seconds,
+        )
+
+    def refresh_runtime_config(self, config_service: Any | None = None) -> None:
+        if config_service is None:
+            from vntdr.services.config_service import ConfigService
+            config_service = ConfigService(self.settings)
+        with self._runtime_config_lock:
+            config_service._load_overrides()
+
+            signature = self._okx_runtime_config_signature(self.settings)
+            if signature == self._okx_runtime_signature:
+                return
+
+            self.monitoring_service.order_executor = self._build_order_executor(self.settings)
+            self.history_service.history_client = self._build_history_client(self.settings)
+            self._okx_runtime_signature = signature
+            import logging
+            logging.getLogger(__name__).info(
+                "Reloaded OKX runtime clients after configuration change "
+                "(demo_trading=%s, trading_enabled=%s)",
+                self.settings.okx.demo_trading,
+                self.settings.okx.trading_enabled,
+            )
 
     def doctor(self) -> HealthCheckResult:
         checks: dict[str, bool] = {}
@@ -130,8 +174,7 @@ class CommandContext:
         volume: float,
         parameter_space: dict[str, list[Any]] | None = None,
     ) -> MonitorResult:
-        from vntdr.services.config_service import ConfigService
-        ConfigService(self.settings)._load_overrides()
+        self.refresh_runtime_config()
         return self.monitoring_service.monitor_once(
             strategy_name=strategy_name,
             symbol=symbol,
@@ -152,8 +195,7 @@ class CommandContext:
         volume: float,
         parameter_space: dict[str, list[Any]] | None = None,
     ) -> MonitorResult:
-        from vntdr.services.config_service import ConfigService
-        ConfigService(self.settings)._load_overrides()
+        self.refresh_runtime_config()
         return await self.monitoring_service.monitor_once_async(
             strategy_name=strategy_name,
             symbol=symbol,

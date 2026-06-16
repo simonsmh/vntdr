@@ -32,8 +32,13 @@ class Strategy(ReviewedStrategyBase):
     """A lightweight CM_MacD_Ult_MTF-inspired multi-timeframe momentum strategy."""
 
     # Thread-safe/run-safe class cache to store precomputed signals.
-    # Cache key: (id(bars), tuple(sorted(parameters.items()))) -> list of signals
-    _cache: dict[tuple[int, tuple[tuple[str, Any], ...]], list[int]] = {}
+    # The object id alone is unsafe because Python can reuse list ids after a
+    # previous bars list is freed. Keep a cheap fingerprint beside the cached
+    # signals so monitoring never reads signals from a different candle set.
+    _cache: dict[
+        tuple[int, tuple[tuple[str, Any], ...]],
+        tuple[tuple[Any, ...], list[int]],
+    ] = {}
 
     @classmethod
     def signal_for_index(
@@ -45,10 +50,32 @@ class Strategy(ReviewedStrategyBase):
         defaults = {**DEFAULT_PARAMETERS, **parameters}
         
         cache_key = (id(bars), tuple(sorted(defaults.items())))
-        if cache_key not in cls._cache:
-            cls._cache[cache_key] = cls._precompute_signals(bars, defaults)
-            
-        return cls._cache[cache_key][index]
+        fingerprint = cls._bars_fingerprint(bars)
+        cached = cls._cache.get(cache_key)
+        if cached is None or cached[0] != fingerprint:
+            cls._cache[cache_key] = (fingerprint, cls._precompute_signals(bars, defaults))
+
+        return cls._cache[cache_key][1][index]
+
+    @staticmethod
+    def _bars_fingerprint(bars: list[BarRecord]) -> tuple[Any, ...]:
+        if not bars:
+            return (0,)
+        first = bars[0]
+        last = bars[-1]
+        return (
+            len(bars),
+            first.datetime,
+            first.open,
+            first.high,
+            first.low,
+            first.close,
+            last.datetime,
+            last.open,
+            last.high,
+            last.low,
+            last.close,
+        )
 
     @classmethod
     def _precompute_signals(cls, bars: list[BarRecord], defaults: dict[str, Any]) -> list[int]:
@@ -106,4 +133,3 @@ class Strategy(ReviewedStrategyBase):
                 signals[index] = 0
                 
         return signals
-
