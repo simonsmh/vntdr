@@ -35,8 +35,12 @@ class OkxHistoryClient:
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.demo_trading = demo_trading
+        # Public market data should always use OKX's normal public market
+        # endpoint. Some instruments, such as QQQ-USDT-SWAP, are unavailable
+        # when the simulated-trading header is attached even though account
+        # and order APIs should still use demo mode.
         self.market_api = market_api or MarketData.MarketAPI(
-            flag="1" if demo_trading else "0",
+            flag="0",
             domain=self.base_url,
         )
         self._executor = ThreadPoolExecutor(max_workers=4)

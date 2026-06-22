@@ -40,8 +40,25 @@ services:
   quant_core:
     image: ghcr.io/simonsmh/vntdr:latest
     restart: always
-    env_file:
-      - .env
+    environment:
+      OKX_API_KEY: ${OKX_API_KEY:-}
+      OKX_SECRET_KEY: ${OKX_SECRET_KEY:-}
+      OKX_PASSPHRASE: ${OKX_PASSPHRASE:-}
+      OKX_REST_BASE_URL: ${OKX_REST_BASE_URL:-https://www.okx.com}
+      OKX_DEMO_TRADING: ${OKX_DEMO_TRADING:-true}
+      PG_HOST: ${PG_HOST:-db}
+      PG_PORT: ${PG_PORT:-5432}
+      PG_USER: ${PG_USER:-vntdr}
+      PG_PASSWORD: ${PG_PASSWORD:-changeme}
+      PG_DB_NAME: ${PG_DB_NAME:-vntdr}
+      REDIS_HOST: ${REDIS_HOST:-cache}
+      REDIS_PORT: ${REDIS_PORT:-6379}
+      REDIS_DB: ${REDIS_DB:-0}
+      REDIS_APPENDONLY: ${REDIS_APPENDONLY:-yes}
+      REDIS_SAVE: ${REDIS_SAVE:-60 1000}
+      REDIS_MAXMEMORY_POLICY: ${REDIS_MAXMEMORY_POLICY:-allkeys-lru}
+      TG_BOT_TOKEN: ${TG_BOT_TOKEN:-}
+      TG_CHAT_ID: ${TG_CHAT_ID:-}
     depends_on:
       db:
         condition: service_healthy
@@ -63,8 +80,25 @@ services:
   webapp:
     image: ghcr.io/simonsmh/vntdr:latest
     restart: always
-    env_file:
-      - .env
+    environment:
+      OKX_API_KEY: ${OKX_API_KEY:-}
+      OKX_SECRET_KEY: ${OKX_SECRET_KEY:-}
+      OKX_PASSPHRASE: ${OKX_PASSPHRASE:-}
+      OKX_REST_BASE_URL: ${OKX_REST_BASE_URL:-https://www.okx.com}
+      OKX_DEMO_TRADING: ${OKX_DEMO_TRADING:-true}
+      PG_HOST: ${PG_HOST:-db}
+      PG_PORT: ${PG_PORT:-5432}
+      PG_USER: ${PG_USER:-vntdr}
+      PG_PASSWORD: ${PG_PASSWORD:-changeme}
+      PG_DB_NAME: ${PG_DB_NAME:-vntdr}
+      REDIS_HOST: ${REDIS_HOST:-cache}
+      REDIS_PORT: ${REDIS_PORT:-6379}
+      REDIS_DB: ${REDIS_DB:-0}
+      REDIS_APPENDONLY: ${REDIS_APPENDONLY:-yes}
+      REDIS_SAVE: ${REDIS_SAVE:-60 1000}
+      REDIS_MAXMEMORY_POLICY: ${REDIS_MAXMEMORY_POLICY:-allkeys-lru}
+      TG_BOT_TOKEN: ${TG_BOT_TOKEN:-}
+      TG_CHAT_ID: ${TG_CHAT_ID:-}
     depends_on:
       db:
         condition: service_healthy

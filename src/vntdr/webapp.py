@@ -212,6 +212,42 @@ def _default_space_text(strategy_name: str) -> str:
     return "\n".join(lines)
 
 
+def _parameter_space_from_mapping(space: dict[str, Any]) -> dict[str, list[Any]]:
+    return {key: _parse_space_value(value) for key, value in space.items()}
+
+
+def _parameter_space_from_text(space_text: str) -> dict[str, list[Any]]:
+    return {
+        key: _parse_space_value(value)
+        for key, value in _parse_params(space_text).items()
+    }
+
+
+def _auto_fit_parameter_space(strategy_name: str) -> dict[str, list[Any]]:
+    strategy_config = STRATEGY_PARAMS.get(strategy_name, {})
+    base_space = _parameter_space_from_mapping(strategy_config.get("space", {}))
+    bounds = _parameter_space_from_mapping(strategy_config.get("bounds", {}))
+    if not bounds:
+        return base_space
+
+    fitted: dict[str, list[Any]] = {}
+    defaults = strategy_config.get("defaults", {})
+    for key, bound_values in bounds.items():
+        base_values = base_space.get(key)
+        if base_values:
+            candidates = [value for value in base_values if value in bound_values]
+            fitted[key] = candidates or base_values
+            continue
+
+        default_value = defaults.get(key)
+        if default_value in bound_values:
+            fitted[key] = [default_value]
+        elif bound_values:
+            fitted[key] = [bound_values[len(bound_values) // 2]]
+
+    return fitted or base_space
+
+
 def _params_line(p: dict[str, Any]) -> str:
     return "  ".join(
         f"{PARAM_LABELS.get(k, k)}={v}" for k, v in p.items()
@@ -846,13 +882,9 @@ def main(port: int = 7860) -> None:
                     return "请先输入日期", None, None, None, {}
                 
                 if auto_fit:
-                    bounds = STRATEGY_PARAMS.get(strategy_name, {}).get("bounds", {})
-                    parameter_space = {k: _parse_space_value(v) for k, v in bounds.items()}
+                    parameter_space = _auto_fit_parameter_space(strategy_name)
                 else:
-                    space_raw = _parse_params(space_text)
-                    parameter_space = {}
-                    for k, v in space_raw.items():
-                        parameter_space[k] = _parse_space_value(v)
+                    parameter_space = _parameter_space_from_text(space_text)
                 config = ResearchJobConfig(
                     strategy_name=strategy_name, symbol=symbol,
                     interval=interval,
@@ -893,13 +925,9 @@ def main(port: int = 7860) -> None:
                     return "请先输入日期", None, None, None, None, None
                 
                 if auto_fit:
-                    bounds = STRATEGY_PARAMS.get(strategy_name, {}).get("bounds", {})
-                    parameter_space = {k: _parse_space_value(v) for k, v in bounds.items()}
+                    parameter_space = _auto_fit_parameter_space(strategy_name)
                 else:
-                    space_raw = _parse_params(space_text)
-                    parameter_space = {}
-                    for k, v in space_raw.items():
-                        parameter_space[k] = _parse_space_value(v)
+                    parameter_space = _parameter_space_from_text(space_text)
                 config = ResearchJobConfig(
                     strategy_name=strategy_name, symbol=symbol,
                     interval=interval,

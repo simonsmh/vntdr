@@ -48,6 +48,8 @@ class RankConfig:
 
 
 class TelegramCommandBot:
+    LIVE_STATUS_TTL_SECONDS = 15 * 60
+
     def __init__(
         self,
         *,
@@ -67,6 +69,9 @@ class TelegramCommandBot:
         self.monitor_once_callback_async = getattr(
             monitor_once_callback, "__self__", None
         ).monitor_once_async if hasattr(monitor_once_callback, "__self__") else None
+        callback_owner = getattr(monitor_once_callback, "__self__", None)
+        monitoring_service = getattr(callback_owner, "monitoring_service", None)
+        self.position_provider = getattr(monitoring_service, "order_executor", None)
         self.watch_job_name = f"watch:{self.chat_id}"
 
     # Redis helpers
@@ -233,24 +238,20 @@ class TelegramCommandBot:
             if not self._allowed_chat(update):
                 return
             keyboard = [
-                [InlineKeyboardButton("📊 回测排名", callback_data="m:rank")],
-                [InlineKeyboardButton("▶️ 执行监控", callback_data="m:run")],
-                [InlineKeyboardButton("🔁 自动监控", callback_data="m:auto")],
-                [InlineKeyboardButton("📋 状态面板", callback_data="m:status")],
-                [InlineKeyboardButton("⚙️ 配置管理", callback_data="m:config")],
+                [InlineKeyboardButton("刷新状态", callback_data="m:status")],
             ]
             text = (
-                "🤖 *Vntdr 量化交易机器人*\n\n"
-                "发送命令或点击下方按钮操作：\n"
-                "• `/rank [交易对] [小时]` — 回测排序\n"
-                "• `/run <交易对> <周期> [策略] [方法]` — 执行一次监控\n"
-                "• `/auto [交易对] [秒]` — 自动排名并监控最佳周期\n"
-                "• `/status` — 查看全局面板\n"
-                "• `/config` — 配置管理\n"
-                "• `/stop` — 停止自动监控\n"
-                "• `/cancel` — 取消当前操作\n"
+                "<b>Vntdr 交易信号推送</b>\n\n"
+                "机器人只保留信号推送和状态查询。\n"
+                "Web UI 负责回测、参数寻优和配置修改。\n\n"
+                "命令：/status 查看当前监控和持仓。"
             )
-            await self._send_safe(update, text, reply_markup=InlineKeyboardMarkup(keyboard))
+            await self._send_safe(
+                update,
+                text,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode=ParseMode.HTML,
+            )
 
         async def rank_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             if not self._allowed_chat(update):
@@ -334,47 +335,14 @@ class TelegramCommandBot:
         async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             if not self._allowed_chat(update):
                 return
-            lines = ["📋 *Vntdr 状态面板*", ""]
-
-            # Watch status
-            watch = self._get_watch_config(context)
-            if watch:
-                lines.append(
-                    f"🔴 *自动监控运行中*\n"
-                    f"  交易对: `{watch.symbol}`\n"
-                    f"  策略: `{watch.strategy_name}`\n"
-                    f"  周期: `{watch.interval}`\n"
-                    f"  方法: `{watch.method}`\n"
-                    f"  轮询: `{watch.poll_seconds}` 秒"
-                )
-            else:
-                lines.append("🟢 *自动监控*: 未运行")
-            lines.append("")
-
-            # Last rank
-            last_rank = self._load_last_rank()
-            if last_rank and last_rank.get("rankings"):
-                lines.append(
-                    f"📊 *最近排名* ({last_rank['symbol']} / {last_rank['lookback_hours']}h)"
-                )
-                for i, r in enumerate(last_rank["rankings"][:3], 1):
-                    medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉"
-                    lines.append(
-                        f"{medal} `{r['interval']}` | 收益: {r['total_return'] * 100:+.2f}% | "
-                        f"夏普: {r['sharpe_ratio']:.2f}"
-                    )
-            else:
-                lines.append("📊 *最近排名*: 无数据，发送 /rank 生成")
-
-            keyboard = [
-                [InlineKeyboardButton("📊 新排名", callback_data="m:rank")],
-                [InlineKeyboardButton("▶️ 运行最佳", callback_data="r:best")],
-                [InlineKeyboardButton("🛑 停止监控", callback_data="stop")],
-            ]
+            text = await self._build_status_panel()
             await self._send_safe(
                 update,
-                "\n".join(lines),
-                reply_markup=InlineKeyboardMarkup(keyboard)
+                text,
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("刷新状态", callback_data="m:status")]]
+                ),
+                parse_mode=ParseMode.HTML,
             )
 
         async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -395,79 +363,22 @@ class TelegramCommandBot:
             await query.answer()
             data = query.data
 
-            if data == "m:rank":
-                # Show rank with default symbol
-                rank_config = RankConfig(
-                    symbol=self.research_service.default_symbol(),
-                    strategy_name=self.research_service.default_strategy(),
-                    method=self.research_service.default_method(),
-                    intervals=self.research_service.available_intervals(),
-                    lookback_hours=self.research_service.default_lookback_hours(),
-                )
-                await self._execute_rank(query, context, rank_config, edit=True)
-            elif data == "m:run":
+            if data == "m:status":
                 await self._send_safe(
                     query,
-                    "请直接发送命令：\n"
-                    "`/run <交易对> <周期> [策略] [方法]`\n"
-                    "例如: `/run XAU-USDT-SWAP 4h`",
-                    edit=True
+                    await self._build_status_panel(),
+                    reply_markup=InlineKeyboardMarkup(
+                        [[InlineKeyboardButton("刷新状态", callback_data="m:status")]]
+                    ),
+                    edit=True,
+                    parse_mode=ParseMode.HTML,
                 )
-            elif data == "m:auto":
-                rank_config = RankConfig(
-                    symbol=self.research_service.default_symbol(),
-                    strategy_name=self.research_service.default_strategy(),
-                    method=self.research_service.default_method(),
-                    intervals=self.research_service.available_intervals(),
-                    lookback_hours=self.research_service.default_lookback_hours(),
-                )
-                rankings = await self._execute_rank(query, context, rank_config, edit=True)
-                if rankings:
-                    watch_config = WatchConfig(
-                        symbol=rank_config.symbol,
-                        strategy_name=rank_config.strategy_name,
-                        interval=rankings[0].interval,
-                        method=rank_config.method,
-                        poll_seconds=60,
-                    )
-                    self._replace_watch_job(context, watch_config)
-                    await self._send_safe(
-                        query,
-                        f"🔁 已按最佳周期 `{watch_config.interval}` 开启自动监控，每 `{watch_config.poll_seconds}` 秒一次。"
-                    )
-            elif data == "m:status":
-                # Reuse status logic but send as new message
-                watch = self._get_watch_config(context)
-                lines = ["📋 *Vntdr 状态面板*", ""]
-                if watch:
-                    lines.append(
-                        f"🔴 *自动监控运行中*\n"
-                        f"  交易对: `{watch.symbol}`\n"
-                        f"  周期: `{watch.interval}`\n"
-                        f"  轮询: `{watch.poll_seconds}` 秒"
-                    )
-                else:
-                    lines.append("🟢 *自动监控*: 未运行")
-                lines.append("")
-                last_rank = self._load_last_rank()
-                if last_rank and last_rank.get("rankings"):
-                    lines.append(f"📊 *最近排名* ({last_rank['symbol']})")
-                    for i, r in enumerate(last_rank["rankings"][:3], 1):
-                        medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉"
-                        lines.append(
-                            f"{medal} `{r['interval']}` | 收益: {r['total_return'] * 100:+.2f}%"
-                        )
-                else:
-                    lines.append("📊 *最近排名*: 无数据")
-                await self._send_safe(query, "\n".join(lines), edit=True)
-            elif data == "m:config":
-                await self._send_safe(query, "请发送 /config 进入配置管理。", edit=True)
             elif data == "stop":
-                removed = self._remove_watch_job(context)
                 await self._send_safe(
                     query,
-                    "🛑 已停止自动监控。" if removed else "ℹ️ 当前没有运行中的自动监控。",
-                    edit=True
+                    "自动监控入口已停用；当前服务由 quant_core 主循环负责监控和推送。",
+                    edit=True,
+                    parse_mode=None,
                 )
             elif data == "rr":
                 # Rerun last rank
@@ -526,7 +437,8 @@ class TelegramCommandBot:
                     edit=True
                 )
 
-        # Config conversation (keep interactive)
+        # Legacy config conversation callbacks are kept for code compatibility,
+        # but the /config entry point is no longer registered in the simplified bot.
         CONFIG_SELECT, CONFIG_VALUE = range(2)
 
         async def config_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -669,70 +581,125 @@ class TelegramCommandBot:
         if application.job_queue is None:
             raise RuntimeError("Telegram job queue is unavailable. Install python-telegram-bot with job-queue extras.")
 
-        # Config conversation handler
-        config_conversation = ConversationHandler(
-            entry_points=[CommandHandler("config", config_entry)],
-            states={
-                CONFIG_SELECT: [
-                    CallbackQueryHandler(config_callback, pattern=r"^cfg:"),
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, config_fallback_text),
-                ],
-                CONFIG_VALUE: [
-                    CallbackQueryHandler(config_callback, pattern=r"^cfgv:"),
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, config_fallback_text),
-                ],
-            },
-            fallbacks=[CommandHandler("cancel", cancel)],
-        )
-
         application.add_handler(CommandHandler("start", start))
-        application.add_handler(CommandHandler("rank", rank_command))
-        application.add_handler(CommandHandler("run", run_command))
-        application.add_handler(CommandHandler("auto", auto_command))
         application.add_handler(CommandHandler("status", status_command))
-        application.add_handler(CommandHandler("stop", stop_command))
-        application.add_handler(config_conversation)
-        application.add_handler(CallbackQueryHandler(button_callback))
+        application.add_handler(CallbackQueryHandler(button_callback, pattern=r"^(m:status|stop)$"))
 
         # Startup tasks: set commands and resume jobs
         async def on_startup(app: Application):
             # 1. Set bot commands for autocomplete
             commands = [
-                BotCommand("start", "开始使用/主菜单"),
-                BotCommand("rank", "回测排序，可选参数: [交易对] [小时]"),
-                BotCommand("run", "执行一次监控: <交易对> <周期> [策略] [方法]"),
-                BotCommand("auto", "自动排名并监控最佳周期"),
-                BotCommand("status", "查看全局面板"),
-                BotCommand("config", "查看和修改配置"),
-                BotCommand("stop", "停止自动监控"),
-                BotCommand("cancel", "取消当前操作"),
+                BotCommand("start", "查看说明"),
+                BotCommand("status", "查看监控和持仓状态"),
             ]
             await app.bot.set_my_commands(commands)
-            
-            # 2. Resume watch job from Redis if it exists
-            import logging
-            logger = logging.getLogger(__name__)
-            config = self._load_watch_config()
-            if config:
-                logger.info(f"Resuming watch job from Redis: {config}")
-                job_queue = app.job_queue
-                if job_queue:
-                    # Clean up any existing job with same name just in case
-                    existing_jobs = job_queue.get_jobs_by_name(self.watch_job_name)
-                    for job in existing_jobs:
-                        job.schedule_removal()
-                        
-                    job_queue.run_repeating(
-                        self._build_watch_callback(),
-                        interval=config.poll_seconds,
-                        first=5, # Give a small delay on startup
-                        name=self.watch_job_name,
-                        data=asdict(config),
-                    )
-                    logger.info("Watch job resumed successfully")
 
         application.post_init = on_startup
         return application
+
+    async def _build_status_panel(self) -> str:
+        live_statuses = self._load_live_statuses()
+        positions = await self._load_current_positions()
+
+        lines = ["<b>Vntdr 状态</b>"]
+        if live_statuses:
+            lines.append("")
+            lines.append("<b>监控</b>")
+            for status in live_statuses[:5]:
+                symbol = escape(str(status.get("symbol", "-")))
+                interval = escape(str(status.get("interval", "-")))
+                signal = self._format_signal(status.get("signal"))
+                bar_time = escape(str(status.get("completed_bar_time") or "-"))
+                heartbeat = escape(str(status.get("time") or "-"))
+                actions = status.get("actions") or []
+                action_text = " + ".join(str(action) for action in actions) if actions else "无"
+                reason = status.get("skipped_reason")
+                suffix = f" | {escape(str(reason))}" if reason else ""
+                lines.append(
+                    f"{symbol} {interval}: <b>{signal}</b> | 动作 {escape(action_text)}{suffix}"
+                )
+                lines.append(f"收盘 {bar_time} | 心跳 {heartbeat}")
+        else:
+            lines.extend(["", "<b>监控</b>", "暂无 live status"])
+
+        lines.append("")
+        lines.append("<b>OKX 持仓</b>")
+        if positions:
+            for pos in positions:
+                inst_id = escape(str(pos.get("instId", "-")))
+                side = self._format_position_side(pos.get("posSide"))
+                size = escape(str(pos.get("pos", "-")))
+                avg_px = escape(str(pos.get("avgPx", "-")))
+                mark_px = escape(str(pos.get("markPx") or pos.get("last") or "-"))
+                upl = escape(str(pos.get("upl", "-")))
+                lines.append(
+                    f"{inst_id}: <b>{side}</b> x {size} | 均价 {avg_px} | 标记 {mark_px} | UPL {upl}"
+                )
+        else:
+            lines.append("无持仓")
+
+        return "\n".join(lines)
+
+    def _load_live_statuses(self) -> list[dict[str, Any]]:
+        if self.redis_client is None:
+            return []
+        statuses: list[dict[str, Any]] = []
+        try:
+            raw_map = self.redis_client.hgetall("vntdr:live_statuses")
+            for raw_value in raw_map.values():
+                statuses.append(self._decode_status(raw_value))
+        except Exception:
+            statuses = []
+
+        if statuses:
+            fresh_statuses = [status for status in statuses if self._is_fresh_status(status)]
+            return sorted(fresh_statuses, key=lambda item: str(item.get("time", "")), reverse=True)
+
+        try:
+            raw = self.redis_client.get("vntdr:live_status")
+            if raw:
+                status = self._decode_status(raw)
+                return [status] if self._is_fresh_status(status) else []
+        except Exception:
+            return []
+        return []
+
+    def _is_fresh_status(self, status: dict[str, Any]) -> bool:
+        import time
+        try:
+            heartbeat = float(status.get("heartbeat", 0))
+        except (TypeError, ValueError):
+            return False
+        return time.time() - heartbeat <= self.LIVE_STATUS_TTL_SECONDS
+
+    def _decode_status(self, raw: Any) -> dict[str, Any]:
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+        if isinstance(raw, str):
+            return json.loads(raw)
+        if isinstance(raw, dict):
+            return raw
+        return {}
+
+    async def _load_current_positions(self) -> list[dict[str, Any]]:
+        if self.position_provider is None:
+            return []
+        import asyncio
+        loop = asyncio.get_event_loop()
+        try:
+            return await loop.run_in_executor(None, self.position_provider.get_current_positions, None)
+        except Exception:
+            return []
+
+    def _format_signal(self, signal: Any) -> str:
+        try:
+            signal_int = int(signal)
+        except (TypeError, ValueError):
+            return "未知"
+        return {1: "LONG", -1: "SHORT", 0: "空仓"}.get(signal_int, str(signal_int))
+
+    def _format_position_side(self, side: Any) -> str:
+        return {"long": "LONG", "short": "SHORT", "net": "NET"}.get(str(side), str(side))
 
     async def _execute_rank(
         self,

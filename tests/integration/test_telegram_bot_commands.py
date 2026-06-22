@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -111,6 +112,23 @@ class FakeRedis:
 
     def delete(self, key: str) -> None:
         self._store.pop(key, None)
+
+    def hgetall(self, key: str) -> dict[str, str]:
+        return {}
+
+
+class FakePositionProvider:
+    def get_current_positions(self, symbol: str | None = None) -> list[dict[str, str]]:
+        return [
+            {
+                "instId": symbol or "XAU-USDT-SWAP",
+                "posSide": "long",
+                "pos": "1",
+                "avgPx": "4335.7",
+                "markPx": "4345.9",
+                "upl": "0.0102",
+            }
+        ]
 
 
 @pytest.fixture
@@ -228,89 +246,17 @@ class TestTelegramBotCommands:
         await handler.callback(update, context)
 
         assert len(sent) == 1
-        assert "Vntdr 量化交易机器人" in sent[0]["text"]
+        assert "Vntdr 交易信号推送" in sent[0]["text"]
         assert sent[0]["reply_markup"] is not None
         assert isinstance(sent[0]["reply_markup"], InlineKeyboardMarkup)
 
-    @pytest.mark.asyncio
-    async def test_rank_command_with_symbol(self, bot):
-        update = _make_update("/rank XAU-USDT-SWAP")
-        sent = []
-
-        async def mock_reply_text(text, **kwargs):
-            sent.append({"text": text, "reply_markup": kwargs.get("reply_markup")})
-
-        update.message.reply_text = mock_reply_text
-        context = AsyncContext(args=["XAU-USDT-SWAP"])
+    def test_legacy_interactive_commands_are_not_registered(self, bot):
         application = bot.build_application()
-        handler = self._find_handler(application, "rank")
-        assert handler is not None
-        await handler.callback(update, context)
-
-        assert len(sent) >= 2
-        assert "开始拉取数据" in sent[0]["text"]
-        assert "排名结果" in sent[-1]["text"]
-        assert "XAU-USDT-SWAP" in sent[-1]["text"]
-        assert sent[-1]["reply_markup"] is not None
-        assert isinstance(sent[-1]["reply_markup"], InlineKeyboardMarkup)
-
-    @pytest.mark.asyncio
-    async def test_run_command_with_args(self, bot):
-        update = _make_update("/run XAU-USDT-SWAP 4h")
-        sent = []
-
-        async def mock_reply_text(text, **kwargs):
-            sent.append({"text": text})
-
-        update.message.reply_text = mock_reply_text
-        context = AsyncContext(args=["XAU-USDT-SWAP", "4h"])
-        application = bot.build_application()
-        handler = self._find_handler(application, "run")
-        assert handler is not None
-        await handler.callback(update, context)
-
-        assert len(sent) >= 2
-        assert "开始执行监控" in sent[0]["text"]
-        assert "XAU-USDT-SWAP" in sent[0]["text"]
-        assert "4h" in sent[0]["text"]
-
-    @pytest.mark.asyncio
-    async def test_run_command_without_enough_args(self, bot):
-        update = _make_update("/run XAU-USDT-SWAP")
-        sent = []
-
-        async def mock_reply_text(text, **kwargs):
-            sent.append({"text": text})
-
-        update.message.reply_text = mock_reply_text
-        context = AsyncContext(args=["XAU-USDT-SWAP"])
-        application = bot.build_application()
-        handler = self._find_handler(application, "run")
-        assert handler is not None
-        await handler.callback(update, context)
-
-        assert len(sent) == 1
-        assert "用法" in sent[0]["text"]
-
-    @pytest.mark.asyncio
-    async def test_stop_command_when_no_watch(self, bot):
-        update = _make_update("/stop")
-        sent = []
-
-        async def mock_reply_text(text, **kwargs):
-            sent.append({"text": text})
-
-        update.message.reply_text = mock_reply_text
-        context = AsyncContext()
-        # Make job_queue.get_jobs_by_name return empty list so no watch is found
-        context.application.job_queue.get_jobs_by_name = lambda name: []
-        application = bot.build_application()
-        handler = self._find_handler(application, "stop")
-        assert handler is not None
-        await handler.callback(update, context)
-
-        assert len(sent) == 1
-        assert ("没有运行" in sent[0]["text"] or "未运行" in sent[0]["text"])
+        assert self._find_handler(application, "rank") is None
+        assert self._find_handler(application, "run") is None
+        assert self._find_handler(application, "auto") is None
+        assert self._find_handler(application, "config") is None
+        assert self._find_handler(application, "stop") is None
 
     @pytest.mark.asyncio
     async def test_status_command_shows_panel(self, bot):
@@ -322,20 +268,37 @@ class TestTelegramBotCommands:
 
         update.message.reply_text = mock_reply_text
         context = AsyncContext()
-        # Ensure no watch jobs exist
-        context.application.job_queue.get_jobs_by_name = lambda name: []
+        bot.redis_client.set(
+            "vntdr:live_status",
+            json.dumps(
+                {
+                    "time": "2026-06-16 10:34:12 UTC",
+                    "symbol": "XAU-USDT-SWAP",
+                    "interval": "1h",
+                    "signal": 1,
+                    "actions": [],
+                    "completed_bar_time": "2026-06-16T09:00:00+00:00",
+                    "heartbeat": time.time(),
+                }
+            ),
+        )
+        bot.position_provider = FakePositionProvider()
         application = bot.build_application()
         handler = self._find_handler(application, "status")
         assert handler is not None
         await handler.callback(update, context)
 
         assert len(sent) == 1
-        assert "状态面板" in sent[0]["text"]
+        assert "Vntdr 状态" in sent[0]["text"]
+        assert "XAU-USDT-SWAP 1h" in sent[0]["text"]
+        assert "LONG" in sent[0]["text"]
+        assert "OKX 持仓" in sent[0]["text"]
+        assert "均价 4335.7" in sent[0]["text"]
         assert sent[0]["reply_markup"] is not None
 
     @pytest.mark.asyncio
-    async def test_inline_callback_menu_rank(self, bot):
-        update = _make_callback_update("m:rank")
+    async def test_inline_callback_refreshes_status(self, bot):
+        update = _make_callback_update("m:status")
         edited = []
 
         async def mock_edit_message_text(text, **kwargs):
@@ -348,51 +311,32 @@ class TestTelegramBotCommands:
         assert handler is not None
         await handler.callback(update, context)
 
-        assert len(edited) >= 1
-        assert "排名结果" in edited[-1]["text"]
-
-    @pytest.mark.asyncio
-    async def test_inline_callback_stop(self, bot):
-        update = _make_callback_update("stop")
-        edited = []
-
-        async def mock_edit_message_text(text, **kwargs):
-            edited.append({"text": text})
-
-        update.callback_query.edit_message_text = mock_edit_message_text
-        context = AsyncContext()
-        # No active jobs
-        context.application.job_queue.get_jobs_by_name = lambda name: []
-        application = bot.build_application()
-        handler = self._find_handler(application, handler_type="CallbackQueryHandler")
-        assert handler is not None
-        await handler.callback(update, context)
-
         assert len(edited) == 1
-        assert ("停止" in edited[0]["text"] or "没有运行" in edited[0]["text"])
+        assert "Vntdr 状态" in edited[0]["text"]
 
-    @pytest.mark.asyncio
-    async def test_rank_redis_persistence(self, bot, fake_redis):
-        update = _make_update("/rank XAU-USDT-SWAP")
-        sent = []
+    def test_live_status_filters_stale_entries(self, bot):
+        fresh = {
+            "time": "2026-06-17 00:10:57 UTC",
+            "symbol": "XAU-USDT-SWAP",
+            "interval": "1h",
+            "signal": 0,
+            "heartbeat": time.time(),
+        }
+        stale = {
+            "time": "2026-06-03 23:39:42 UTC",
+            "symbol": "XAU-USDT-SWAP",
+            "interval": "4h",
+            "signal": 0,
+            "heartbeat": 1780529982.446046,
+        }
+        bot.redis_client.hgetall = lambda key: {
+            "fresh": json.dumps(fresh),
+            "stale": json.dumps(stale),
+        }
 
-        async def mock_reply_text(text, **kwargs):
-            sent.append({"text": text})
+        statuses = bot._load_live_statuses()
 
-        update.message.reply_text = mock_reply_text
-        context = AsyncContext(args=["XAU-USDT-SWAP"])
-        application = bot.build_application()
-        handler = self._find_handler(application, "rank")
-        assert handler is not None
-        await handler.callback(update, context)
-
-        # Verify Redis has stored the rank result
-        key = bot._redis_key("rank:last")
-        raw = fake_redis.get(key)
-        assert raw is not None
-        data = json.loads(raw)
-        assert data["symbol"] == "XAU-USDT-SWAP"
-        assert len(data["rankings"]) > 0
+        assert [status["interval"] for status in statuses] == ["1h"]
 
     def test_allowed_chat_matches(self, bot):
         class FakeMessage:

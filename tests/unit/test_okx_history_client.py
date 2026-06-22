@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+import pytest
+
 from vntdr.services.history import OkxHistoryClient
 
 
@@ -44,3 +46,19 @@ def test_okx_history_client_uses_sdk_and_normalizes_30m_rows() -> None:
     assert len(rows) == 2
     assert rows[0]["interval"] == "30m"
     assert rows[0]["close"] == 102.0
+
+
+def test_okx_history_client_uses_public_market_flag_even_in_demo_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    created: dict[str, str] = {}
+
+    class CapturingMarketApi(FakeMarketApi):
+        def __init__(self, **kwargs) -> None:
+            super().__init__()
+            created.update(kwargs)
+
+    monkeypatch.setattr("vntdr.services.history.MarketData.MarketAPI", CapturingMarketApi)
+
+    OkxHistoryClient(base_url="https://www.okx.com", demo_trading=True)
+
+    assert created["flag"] == "0"
+    assert created["domain"] == "https://www.okx.com"
