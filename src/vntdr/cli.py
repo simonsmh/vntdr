@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import importlib
+import os
 import time
-import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Any
@@ -10,10 +10,10 @@ from typing import Any
 import redis
 import typer
 
-from vntdr.config import Settings
 from vntdr.adapters.orders import OkxOrderExecutor, SimulatedOrderExecutor
 from vntdr.adapters.state import RedisSignalStore
 from vntdr.adapters.telegram import TelegramNotifier
+from vntdr.config import Settings
 from vntdr.models import HealthCheckResult, MonitorResult, ResearchJobConfig, SyncResult
 from vntdr.services.history import HistorySyncService, OkxHistoryClient
 from vntdr.services.monitoring import MonitoringService
@@ -24,6 +24,21 @@ from vntdr.storage.database import Database
 from vntdr.storage.repositories import MarketDataRepository, ResearchRunRepository
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
+
+
+DEFAULT_GRADIO_PORT = 7860
+
+
+def _resolve_gradio_port(port: int | None) -> int:
+    if port is not None:
+        return port
+    raw_port = os.getenv("GRADIO_PORT")
+    if raw_port is None or raw_port == "":
+        return DEFAULT_GRADIO_PORT
+    try:
+        return int(raw_port)
+    except ValueError as exc:
+        raise typer.BadParameter("GRADIO_PORT must be an integer") from exc
 
 
 class CommandContext:
@@ -541,6 +556,7 @@ def live_command(
     # Start Telegram bot in background thread if token is configured
     if settings.telegram.bot_token and settings.telegram.chat_id:
         import threading
+
         from vntdr.adapters.telegram_bot import TelegramCommandBot
         from vntdr.services.config_service import ConfigService
         logger.info("Starting Telegram command bot in background thread")
@@ -607,10 +623,13 @@ def live_command(
 
 @app.command("gradio")
 def gradio_command(
-    port: int = typer.Option(7860, help="Port to listen on"),
+    port: int | None = typer.Option(
+        None,
+        help="Port to listen on. Defaults to GRADIO_PORT or 7860.",
+    ),
 ) -> None:
     from vntdr.webapp import main as run_webapp
-    run_webapp(port=port)
+    run_webapp(port=_resolve_gradio_port(port))
 
 
 @app.command("telegram-bot")

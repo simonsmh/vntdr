@@ -99,13 +99,14 @@ services:
       REDIS_MAXMEMORY_POLICY: ${REDIS_MAXMEMORY_POLICY:-allkeys-lru}
       TG_BOT_TOKEN: ${TG_BOT_TOKEN:-}
       TG_CHAT_ID: ${TG_CHAT_ID:-}
+      GRADIO_PORT: ${GRADIO_PORT:-7860}
     depends_on:
       db:
         condition: service_healthy
       cache:
         condition: service_healthy
     ports:
-      - "7860:7860"
+      - "${GRADIO_PORT:-7860}:${GRADIO_PORT:-7860}"
     command: ["vntdr", "gradio"]
     volumes:
       - config_data:/root/.vntdr

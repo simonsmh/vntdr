@@ -1,14 +1,14 @@
 from __future__ import annotations
 
+import sys
 import threading
 from dataclasses import dataclass
 from types import SimpleNamespace
 
 from typer.testing import CliRunner
 
+from vntdr.cli import CommandContext, app
 from vntdr.config import Settings
-from vntdr.cli import app
-from vntdr.cli import CommandContext
 from vntdr.models import HealthCheckResult, MonitorResult, SyncResult
 from vntdr.services.config_service import ConfigService
 
@@ -132,6 +132,34 @@ def test_live_once_reports_signal_and_actions(monkeypatch, env_map: dict[str, st
     assert result.exit_code == 0
     assert "signal=-1" in result.stdout
     assert "sell_short" in result.stdout
+
+
+def test_gradio_command_uses_env_port(monkeypatch) -> None:
+    called: list[int] = []
+    monkeypatch.setitem(
+        sys.modules,
+        "vntdr.webapp",
+        SimpleNamespace(main=lambda port: called.append(port)),
+    )
+
+    result = runner.invoke(app, ["gradio"], env={"GRADIO_PORT": "8787"})
+
+    assert result.exit_code == 0
+    assert called == [8787]
+
+
+def test_gradio_command_option_overrides_env_port(monkeypatch) -> None:
+    called: list[int] = []
+    monkeypatch.setitem(
+        sys.modules,
+        "vntdr.webapp",
+        SimpleNamespace(main=lambda port: called.append(port)),
+    )
+
+    result = runner.invoke(app, ["gradio", "--port", "9090"], env={"GRADIO_PORT": "8787"})
+
+    assert result.exit_code == 0
+    assert called == [9090]
 
 
 def test_command_context_hot_reloads_okx_runtime_clients(tmp_path, env_map: dict[str, str]) -> None:

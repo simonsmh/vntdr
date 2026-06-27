@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -463,7 +464,17 @@ def _build_kline_macd_chart(bars, signals, fast_length, slow_length, signal_leng
 
 # ── Gradio App ────────────────────────────────────────────────────────
 
-def main(port: int = 7860) -> None:
+def _resolve_gradio_port(port: int | None) -> int:
+    if port is not None:
+        return port
+    raw_port = os.getenv("GRADIO_PORT")
+    if raw_port is None or raw_port == "":
+        return 7860
+    return int(raw_port)
+
+
+def main(port: int | None = None) -> None:
+    port = _resolve_gradio_port(port)
     cs = _get_config_service()
     cs._load_overrides()
     default_start, default_end = _default_dates(cs)
