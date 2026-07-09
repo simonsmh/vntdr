@@ -527,6 +527,7 @@ class ResearchService:
         position = 0
         trade_count = 0
         equity = [1.0]
+        step_returns: list[float] = []
         signals: list[int] = []
         
         # Get fee rate from settings
@@ -553,6 +554,7 @@ class ResearchService:
             signals.append(signal)
             
             if signal != position:
+                before_fee_equity = equity[-1]
                 if position != 0:
                     equity[-1] *= (1 - fee_rate)
                     trade_count += 1
@@ -561,23 +563,29 @@ class ResearchService:
                     equity[-1] *= (1 - fee_rate)
                     trade_count += 1
 
+                if before_fee_equity > 0:
+                    step_returns.append((equity[-1] / before_fee_equity) - 1)
+                else:
+                    step_returns.append(0.0)
                 position = signal
 
             # PnL is realized from bar 'index' to 'index + 1'
             price_return = (bars[index + 1].close / bars[index].close) - 1
             pnl = price_return * position
-            equity.append(equity[-1] * (1 + pnl))
+            next_equity = equity[-1] * (1 + pnl)
+            if equity[-1] > 0:
+                step_returns.append((next_equity / equity[-1]) - 1)
+            else:
+                step_returns.append(0.0)
+            equity.append(next_equity)
             
         # Close final position if any to account for exit fees
         if position != 0:
+            before_fee_equity = equity[-1]
             equity[-1] *= (1 - fee_rate)
             trade_count += 1
-
-        # Calculate step returns from equity curve changes to include transaction fees
-        step_returns = []
-        for i in range(len(equity) - 1):
-            if equity[i] > 0:
-                step_returns.append((equity[i + 1] / equity[i]) - 1)
+            if before_fee_equity > 0:
+                step_returns.append((equity[-1] / before_fee_equity) - 1)
             else:
                 step_returns.append(0.0)
 

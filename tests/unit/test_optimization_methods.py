@@ -11,6 +11,12 @@ from vntdr.storage.repositories import MarketDataRepository, ResearchRunReposito
 from vntdr.webapp import _auto_fit_parameter_space
 
 
+class AlwaysLongStrategy:
+    @classmethod
+    def signal_for_index(cls, _bars, _index, _parameters):
+        return 1
+
+
 def test_heuristic_and_grid_optimization_methods(
     tmp_path,
     env_map: dict[str, str],
@@ -223,3 +229,45 @@ def test_heuristic_uses_exact_search_for_medium_sized_spaces(
 
     assert len(seen) == 11 * 11 * 11
     assert evaluations[0][0] == {"a": 10, "b": 10, "c": 10, "d": 0}
+
+
+def test_backtest_fee_rate_affects_total_return_and_step_metrics(
+    tmp_path,
+    env_map: dict[str, str],
+    sample_xau_bar_payloads: list[dict[str, object]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "research.sqlite3"
+    database = Database(f"sqlite+pysqlite:///{db_path}")
+    database.create_schema()
+    repository = MarketDataRepository(database)
+    repository.upsert_bars_from_payloads(sample_xau_bar_payloads[:3])
+
+    settings = Settings.from_mapping(
+        {
+            **env_map,
+            "VNTDR_DATABASE_URL": f"sqlite+pysqlite:///{db_path}",
+            "VNTDR_REPORT_DIR": str(tmp_path / "reports"),
+            "VNTDR_TAKER_FEE_RATE": "0.01",
+            "VNTDR_USE_MAKER_FEE": "false",
+        }
+    )
+    service = ResearchService(
+        settings=settings,
+        market_data_repository=repository,
+        research_run_repository=ResearchRunRepository(database),
+    )
+    monkeypatch.setattr(service, "_load_strategy", lambda _strategy_name: AlwaysLongStrategy)
+
+    bars = repository.fetch_bars(
+        "XAUUSDT",
+        "4h",
+        datetime(2026, 1, 1, tzinfo=timezone.utc),
+        datetime(2026, 1, 1, 8, 0, tzinfo=timezone.utc),
+    )
+    outcome = service._execute_backtest(bars, "always_long", {})
+
+    gross_return = bars[-1].close / bars[0].close - 1
+    assert outcome.metrics["total_return"] < gross_return
+    assert outcome.metrics["trade_count"] == 2.0
+    assert outcome.metrics["win_rate"] < 1.0
