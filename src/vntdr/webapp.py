@@ -608,6 +608,11 @@ def main(port: int | None = None) -> None:
                                     choices=[("遗传算法 (GA)", "ga"), ("网格搜索 (Grid Search)", "grid"), ("A* 启发式搜索 (Heuristic)", "heuristic")],
                                     value="heuristic",
                                 )
+                                opt_target = gr.Dropdown(
+                                    label="优化目标",
+                                    choices=[("总收益率", "return"), ("夏普比率", "sharpe")],
+                                    value=cs.get("research.optimize_target") or "return",
+                                )
                                 opt_auto_fit = gr.Checkbox(
                                     label="自动范围拟合", value=False,
                                 )
@@ -629,6 +634,11 @@ def main(port: int | None = None) -> None:
                                     label="寻优算法",
                                     choices=[("遗传算法 (GA)", "ga"), ("网格搜索 (Grid Search)", "grid"), ("A* 启发式搜索 (Heuristic)", "heuristic")],
                                     value="heuristic",
+                                )
+                                wf_target = gr.Dropdown(
+                                    label="训练优化目标",
+                                    choices=[("总收益率", "return"), ("夏普比率", "sharpe")],
+                                    value=cs.get("research.optimize_target") or "return",
                                 )
                                 wf_auto_fit = gr.Checkbox(label="走查自动范围拟合", value=False)
                             wf_run_btn = gr.Button("🏁 运行走查回测", variant="primary")
@@ -886,7 +896,7 @@ def main(port: int | None = None) -> None:
             except Exception as e:
                 return f"错误：{e}", None, None, None, None
 
-        def run_optimize(strategy_name, symbol, interval, start, end, space_text, auto_fit, method):
+        def run_optimize(strategy_name, symbol, interval, start, end, space_text, auto_fit, method, optimize_target):
             try:
                 ctx, _, _ = _get_services()
                 if not start or not end:
@@ -903,20 +913,20 @@ def main(port: int | None = None) -> None:
                     end=_parse_datetime(end, is_end=True),
                     mode="optimize",
                     parameter_space=parameter_space,
-                    optimize_target=ctx.settings.research.optimize_target,
+                    optimize_target=optimize_target,
                 )
                 report = ctx.optimize(config, method=method)
 
                 top_rows = [
                     [
                         _params_line(r),
-                        r.get("sharpe_ratio", r.get("score", "") if ctx.settings.research.optimize_target != "return" else ""),
+                        r.get("sharpe_ratio", r.get("score", "") if optimize_target != "return" else ""),
                         r.get("total_return", "")
                     ]
                     for r in report.top_results
                 ]
                 return (
-                    f"最优夏普：{report.metrics.get('sharpe_ratio', 0):.4f}" if ctx.settings.research.optimize_target != "return" else f"最优收益率：{report.metrics.get('total_return', 0):.2%}",
+                    f"最优夏普：{report.metrics.get('sharpe_ratio', 0):.4f}" if optimize_target != "return" else f"最优收益率：{report.metrics.get('total_return', 0):.2%}",
                     _metrics_df(report.metrics),
                     _params_df({PARAM_LABELS.get(k, k): v for k, v in report.best_parameters.items()}),
                     pd.DataFrame(top_rows, columns=["参数组合", "夏普", "收益率"]),
@@ -928,7 +938,7 @@ def main(port: int | None = None) -> None:
 
         def run_walk_forward(
             strategy_name, symbol, interval, start, end,
-            space_text, train_window, test_window, auto_fit, method,
+            space_text, train_window, test_window, auto_fit, method, optimize_target,
         ):
             try:
                 ctx, _, _ = _get_services()
@@ -949,7 +959,7 @@ def main(port: int | None = None) -> None:
                     parameter_space=parameter_space,
                     train_window=int(train_window),
                     test_window=int(test_window),
-                    optimize_target=ctx.settings.research.optimize_target,
+                    optimize_target=optimize_target,
                 )
                 bars = ctx._load_bars(config)
                 if not bars:
@@ -1057,7 +1067,7 @@ def main(port: int | None = None) -> None:
             import redis
             import json
             from datetime import datetime, timezone
-            from vntdr.adapters.orders import OkxOrderExecutor, SimulatedOrderExecutor
+            from vntdr.adapters.orders import OkxOrderExecutor
             
             cs = _get_config_service()
             settings = cs.settings
@@ -1426,7 +1436,7 @@ def main(port: int | None = None) -> None:
                             gr.update(value=t.get("volume", 1.0)),
                             gr.update(value=params_text)
                         )
-            except Exception as e:
+            except Exception:
                 pass
             return gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
 
@@ -1497,9 +1507,9 @@ def main(port: int | None = None) -> None:
             outputs=[live_health, live_config, live_account, live_positions, live_logs_table]
         )
 
-        def run_optimize_dispatch(strategy_name, symbol, interval, start, end, space_text, auto_fit, method):
+        def run_optimize_dispatch(strategy_name, symbol, interval, start, end, space_text, auto_fit, method, optimize_target):
             status, metrics, params, top_table, best_params, top_results = run_optimize(
-                strategy_name, symbol, interval, start, end, space_text, auto_fit, method
+                strategy_name, symbol, interval, start, end, space_text, auto_fit, method, optimize_target
             )
             choices = []
             if top_results:
@@ -1520,7 +1530,7 @@ def main(port: int | None = None) -> None:
 
         opt_run_btn.click(
             run_optimize_dispatch,
-            inputs=[global_strategy, global_symbol, global_interval, global_start, global_end, opt_space, opt_auto_fit, opt_method],
+            inputs=[global_strategy, global_symbol, global_interval, global_start, global_end, opt_space, opt_auto_fit, opt_method, opt_target],
             outputs=[opt_status, opt_metrics_table, opt_params_table, opt_top_table, opt_best_params, opt_top_results, opt_select_combo, visual_tabs],
         )
 
@@ -1569,11 +1579,11 @@ def main(port: int | None = None) -> None:
 
         def run_walk_forward_dispatch(
             strategy_name, symbol, interval, start, end,
-            space_text, train_window, test_window, auto_fit, method,
+            space_text, train_window, test_window, auto_fit, method, optimize_target,
         ):
             status, metrics, params_df, folds_df, fig, trades_df = run_walk_forward(
                 strategy_name, symbol, interval, start, end,
-                space_text, train_window, test_window, auto_fit, method,
+                space_text, train_window, test_window, auto_fit, method, optimize_target,
             )
             return status, metrics, params_df, folds_df, fig, trades_df, gr.update(selected="visual_walk_forward")
 
@@ -1581,7 +1591,7 @@ def main(port: int | None = None) -> None:
             run_walk_forward_dispatch,
             inputs=[
                 global_strategy, global_symbol, global_interval, global_start, global_end,
-                opt_space, wf_train, wf_test, wf_auto_fit, wf_method,
+                opt_space, wf_train, wf_test, wf_auto_fit, wf_method, wf_target,
             ],
             outputs=[wf_status, wf_metrics_table, wf_params_table, wf_folds_table, wf_folds_plot, wf_trades_table, visual_tabs],
         )

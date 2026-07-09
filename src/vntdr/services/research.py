@@ -1,19 +1,20 @@
 from __future__ import annotations
 
+import asyncio
 import importlib
 import itertools
 import json
-import random
-from dataclasses import dataclass
 import math
-from statistics import mean, pstdev, stdev
-from typing import Any
-import asyncio
+import random
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from typing import Any
 
 from vntdr.config import Settings
 from vntdr.models import BarRecord, FoldResult, ResearchJobConfig, ResearchReport, aggregate_metrics
 from vntdr.storage.repositories import MarketDataRepository, ResearchRunRepository
+
+EXACT_SEARCH_COMBINATION_LIMIT = 10_000
 
 
 @dataclass
@@ -323,8 +324,17 @@ class ResearchService:
         m = str(method).lower().strip()
         
         # Calculate total combinations
-        total_combinations = math.prod(len(v) for v in parameter_space.values()) if parameter_space else 0
-        if total_combinations <= 1000:
+        total_combinations = (
+            math.prod(len(v) for v in parameter_space.values()) if parameter_space else 0
+        )
+        should_run_exact = (
+            total_combinations <= 1000
+            or (
+                m in ("heuristic", "bfs", "astar")
+                and total_combinations <= EXACT_SEARCH_COMBINATION_LIMIT
+            )
+        )
+        if should_run_exact:
             m = "grid"
 
         if m == "grid":
@@ -351,19 +361,7 @@ class ResearchService:
             outcome = self._execute_backtest(bars, strategy_name, params)
             evaluations.append((params, outcome.metrics))
             
-        return sorted(
-            evaluations,
-            key=lambda item: (
-                -999.0 if item[1].get("trade_count", 0) == 0 else item[1].get("total_return", 0.0),
-                -999.0 if item[1].get("trade_count", 0) == 0 else item[1].get("sharpe_ratio", 0.0)
-            )
-            if optimize_target == "return"
-            else (
-                -999.0 if item[1].get("trade_count", 0) == 0 else item[1].get("sharpe_ratio", 0.0),
-                -999.0 if item[1].get("trade_count", 0) == 0 else item[1].get("total_return", 0.0)
-            ),
-            reverse=True
-        )
+        return self._sort_evaluations(evaluations, optimize_target)
 
     def _run_heuristic_search(
         self,
@@ -445,19 +443,7 @@ class ResearchService:
                     if eval_count >= max_evaluations:
                         break
                         
-        return sorted(
-            evaluations.values(),
-            key=lambda item: (
-                -999.0 if item[1].get("trade_count", 0) == 0 else item[1].get("total_return", 0.0),
-                -999.0 if item[1].get("trade_count", 0) == 0 else item[1].get("sharpe_ratio", 0.0)
-            )
-            if optimize_target == "return"
-            else (
-                -999.0 if item[1].get("trade_count", 0) == 0 else item[1].get("sharpe_ratio", 0.0),
-                -999.0 if item[1].get("trade_count", 0) == 0 else item[1].get("total_return", 0.0)
-            ),
-            reverse=True
-        )
+        return self._sort_evaluations(list(evaluations.values()), optimize_target)
 
     def _run_genetic_search(
         self,
@@ -486,17 +472,7 @@ class ResearchService:
                     evaluations[signature] = (parameters.copy(), outcome.metrics)
                 scored.append(evaluations[signature])
             # Sort by target primarily, penalizing zero trades to avoid passive dominance
-            if optimize_target == "return":
-                key_fn = lambda item: (
-                    -999.0 if item[1].get("trade_count", 0) == 0 else item[1].get("total_return", 0.0),
-                    -999.0 if item[1].get("trade_count", 0) == 0 else item[1].get("sharpe_ratio", 0.0)
-                )
-            else:
-                key_fn = lambda item: (
-                    -999.0 if item[1].get("trade_count", 0) == 0 else item[1].get("sharpe_ratio", 0.0),
-                    -999.0 if item[1].get("trade_count", 0) == 0 else item[1].get("total_return", 0.0)
-                )
-            scored.sort(key=key_fn, reverse=True)
+            scored = self._sort_evaluations(scored, optimize_target)
             # Maintain top 20% as potential parents
             parents = [parameters for parameters, _ in scored[:max(2, pop_size // 5)]]
             # Elitism: keep top 2 directly
@@ -510,19 +486,33 @@ class ResearchService:
                 }
                 next_population.append(child)
             population = next_population
-        return sorted(
-            evaluations.values(),
-            key=lambda item: (
-                -999.0 if item[1].get("trade_count", 0) == 0 else item[1].get("total_return", 0.0),
-                -999.0 if item[1].get("trade_count", 0) == 0 else item[1].get("sharpe_ratio", 0.0)
-            )
-            if optimize_target == "return"
-            else (
-                -999.0 if item[1].get("trade_count", 0) == 0 else item[1].get("sharpe_ratio", 0.0),
-                -999.0 if item[1].get("trade_count", 0) == 0 else item[1].get("total_return", 0.0)
-            ),
-            reverse=True
-        )
+        return self._sort_evaluations(list(evaluations.values()), optimize_target)
+
+    def _sort_evaluations(
+        self,
+        evaluations: list[tuple[dict[str, Any], dict[str, float]]],
+        optimize_target: str,
+    ) -> list[tuple[dict[str, Any], dict[str, float]]]:
+        target = str(optimize_target).lower().strip()
+
+        def metric_value(metrics: dict[str, float], metric_name: str) -> float:
+            if metrics.get("trade_count", 0) == 0:
+                return -999.0
+            return metrics.get(metric_name, 0.0)
+
+        if target == "return":
+            def key_fn(item: tuple[dict[str, Any], dict[str, float]]) -> tuple[float, float]:
+                return (
+                    metric_value(item[1], "total_return"),
+                    metric_value(item[1], "sharpe_ratio"),
+                )
+        else:
+            def key_fn(item: tuple[dict[str, Any], dict[str, float]]) -> tuple[float, float]:
+                return (
+                    metric_value(item[1], "sharpe_ratio"),
+                    metric_value(item[1], "total_return"),
+                )
+        return sorted(evaluations, key=key_fn, reverse=True)
 
     def _execute_backtest(
         self,

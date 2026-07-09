@@ -101,6 +101,7 @@ class TelegramResearchService:
                     end=end,
                     mode="optimize",
                     parameter_space=parameter_space,
+                    optimize_target=getattr(self.settings.research, "optimize_target", "sharpe"),
                 ),
                 method=method,
             )
