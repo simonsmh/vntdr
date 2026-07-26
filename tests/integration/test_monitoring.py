@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 
 from vntdr.config import Settings
 from vntdr.services.monitoring import MonitoringService
@@ -57,6 +58,7 @@ def test_monitoring_reverses_from_long_to_short_and_notifies(
             "VNTDR_DATABASE_URL": f"sqlite+pysqlite:///{db_path}",
             "VNTDR_REPORT_DIR": str(tmp_path / "reports"),
             "VNTDR_ALLOWED_SYMBOLS": "XAUUSDT",
+            "VNTDR_EXECUTION_MODE": "live",
         }
     )
     research_service = ResearchService(
@@ -90,7 +92,7 @@ def test_monitoring_reverses_from_long_to_short_and_notifies(
     )
 
     assert result.signal == -1
-    assert executor.actions == ["sell_long", "sell_short"]
+    assert executor.actions == []
     assert notifier.messages and "XAUUSDT" in notifier.messages[0]
     lines = notifier.messages[0].splitlines()
     assert "XAUUSDT 4h SHORT @" in lines[0]
@@ -119,6 +121,7 @@ def test_monitoring_processes_each_closed_bar_only_once(
             "VNTDR_DATABASE_URL": f"sqlite+pysqlite:///{db_path}",
             "VNTDR_REPORT_DIR": str(tmp_path / "reports"),
             "VNTDR_ALLOWED_SYMBOLS": "XAUUSDT",
+            "VNTDR_EXECUTION_MODE": "live",
         }
     )
     research_service = ResearchService(
@@ -158,5 +161,27 @@ def test_monitoring_processes_each_closed_bar_only_once(
     assert first.actions == ["sell_long", "sell_short"]
     assert second.notification_sent is False
     assert second.actions == []
-    assert executor.actions == ["sell_long", "sell_short"]
+    assert executor.actions == []
     assert len(notifier.messages) == 1
+
+
+def test_monitoring_observes_minimum_holding_before_reversal(
+    tmp_path, env_map: dict[str, str], sample_xau_bar_payloads: list[dict[str, object]], monkeypatch
+) -> None:
+    db_path = tmp_path / "holding.sqlite3"
+    database = Database(f"sqlite+pysqlite:///{db_path}")
+    database.create_schema()
+    market_repo = MarketDataRepository(database)
+    market_repo.upsert_bars_from_payloads(sample_xau_bar_payloads)
+    settings = Settings.from_mapping({**env_map, "VNTDR_DATABASE_URL": f"sqlite+pysqlite:///{db_path}", "VNTDR_ALLOWED_SYMBOLS": "XAUUSDT"})
+    research = ResearchService(settings=settings, market_data_repository=market_repo, research_run_repository=ResearchRunRepository(database))
+    monkeypatch.setattr(research, "latest_signal", lambda **kwargs: -1)
+    state = MemorySignalStore({
+        "signal:XAUUSDT:4h:cm_macd_ult_mtf": 1,
+        "position_opened_bar_ts:XAUUSDT:4h:cm_macd_ult_mtf": int(datetime.fromisoformat(str(sample_xau_bar_payloads[-2]["datetime"])).timestamp()),
+    })
+    service = MonitoringService(research_service=research, market_data_repository=market_repo, notifier=FakeNotifier(), order_executor=FakeExecutor(), signal_store=state, risk_manager=RiskManager(settings.risk))
+
+    result = service.monitor_once(strategy_name="cm_macd_ult_mtf", symbol="XAUUSDT", interval="4h", parameters={"min_holding_bars": 10}, volume=1)
+
+    assert result.signal == 1

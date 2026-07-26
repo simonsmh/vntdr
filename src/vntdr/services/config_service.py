@@ -20,8 +20,12 @@ class ConfigService:
         "research.maker_fee_rate": "💵 Maker 手续费率",
         "research.taker_fee_rate": "💵 Taker 手续费率",
         "research.use_maker_fee": "⚡ 使用 Maker 费率",
+        "research.slippage_bps": "📉 滑点（基点）",
+        "research.spread_bps": "↔️ 买卖价差（基点）",
+        "research.funding_rate_per_bar": "💱 每根K线资金费率",
         "research.optimize_target": "🎯 寻优打分排序指标",
         "research.trade_mode": "🔄 交易模式 (多空/仅多/仅空)",
+        "research.execution_mode": "🚦 执行模式 (仅通知/模拟/实盘)",
         "risk.max_strategy_capital": "🛡️ 单策略最大资金",
         "risk.max_total_exposure": "🛡️ 最大总敞口",
         "risk.max_drawdown": "📉 最大回撤限制",
@@ -157,8 +161,12 @@ class ConfigService:
             "maker_fee_rate",
             "taker_fee_rate",
             "use_maker_fee",
+            "slippage_bps",
+            "spread_bps",
+            "funding_rate_per_bar",
             "optimize_target",
             "trade_mode",
+            "execution_mode",
         ]:
             result[f"research.{key}"] = getattr(self.settings.research, key)
 

@@ -848,6 +848,9 @@ class TelegramCommandBot:
 
     def _format_monitor_result(self, result) -> str:
         actions = ", ".join(result.actions) if result.actions else "none"
+        version_line = ""
+        if getattr(result, "strategy_version_id", None):
+            version_line = f"\n版本: `{self._escape_markdown_v2_code(str(result.strategy_version_id))}`"
         return (
             f"✅ *监控完成*\n"
             f"`{self._escape_markdown_v2_code(result.symbol)}` `{self._escape_markdown_v2_code(result.interval)}`\n"
@@ -856,6 +859,7 @@ class TelegramCommandBot:
             f"操作: `{self._escape_markdown_v2_code(actions)}`\n"
             f"参数: `{self._escape_markdown_v2_code(str(result.best_parameters))}`\n"
             f"通知: `{'已发送' if result.notification_sent else '无'}`"
+            f"{version_line}"
         )
 
     def _replace_watch_job(self, context, config: WatchConfig) -> None:

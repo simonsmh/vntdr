@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+import pytest
+
 from vntdr.config import Settings
 from vntdr.models import ResearchJobConfig
 from vntdr.services.research import ResearchService
@@ -66,6 +68,13 @@ def test_backtest_optimize_and_walk_forward_generate_reports(
     assert optimize.best_parameters["lookback"] in {2, 3, 4}
     assert len(optimize.top_results) == 3
     assert len(walk_forward.fold_results) >= 1
+    compounded_fold_return = 1.0
+    for fold in walk_forward.fold_results:
+        compounded_fold_return *= 1 + fold.metrics["total_return"]
+    assert walk_forward.metrics["total_return"] == pytest.approx(
+        compounded_fold_return - 1,
+        abs=1e-5,
+    )
     assert report_dir.joinpath("demo_momentum_backtest.md").exists()
     assert report_dir.joinpath("demo_momentum_optimize.json").exists()
     assert report_dir.joinpath("demo_momentum_walk_forward.md").exists()

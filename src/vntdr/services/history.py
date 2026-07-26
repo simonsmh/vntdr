@@ -164,6 +164,7 @@ class HistorySyncService:
         start: datetime,
         end: datetime,
         fill_missing: bool,
+        calendar: str = "continuous",
     ) -> SyncResult:
         job_id = self.research_run_repository.create_sync_job(symbol, interval, start, end)
         try:
@@ -180,7 +181,12 @@ class HistorySyncService:
                 end,
                 self.settings.research.sync_batch_limit,
             )
-            cleaned = clean_bars(payloads, interval=interval, fill_missing=fill_missing)
+            cleaned = clean_bars(
+                payloads,
+                interval=interval,
+                fill_missing=fill_missing,
+                calendar=calendar,
+            )
             inserted = self.market_data_repository.upsert_bars(cleaned.bars)
             self.research_run_repository.complete_sync_job(
                 job_id,
@@ -213,13 +219,19 @@ class HistorySyncService:
         start: datetime,
         end: datetime,
         fill_missing: bool,
+        calendar: str = "continuous",
     ) -> SyncResult:
+        from functools import partial
+
         return await asyncio.get_event_loop().run_in_executor(
             self._executor,
-            self.sync,
-            symbol,
-            interval,
-            start,
-            end,
-            fill_missing
+            partial(
+                self.sync,
+                symbol=symbol,
+                interval=interval,
+                start=start,
+                end=end,
+                fill_missing=fill_missing,
+                calendar=calendar,
+            ),
         )

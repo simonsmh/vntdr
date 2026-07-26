@@ -20,6 +20,9 @@ def calculate_metrics(
             "trade_count": float(trade_count),
             "win_rate": 0.0,
             "profit_factor": 0.0,
+            "cagr": 0.0,
+            "sortino_ratio": 0.0,
+            "calmar_ratio": 0.0,
         }
         
     avg_return = mean(returns)
@@ -37,6 +40,10 @@ def calculate_metrics(
         sharpe = (avg_return / volatility) * math.sqrt(periods_per_year)
     else:
         sharpe = 0.0
+
+    downside = [value for value in returns if value < 0]
+    downside_deviation = math.sqrt(sum(value * value for value in downside) / len(downside)) if downside else 0.0
+    sortino = (avg_return / downside_deviation) * math.sqrt(periods_per_year) if downside_deviation else 0.0
         
     pos_returns = [r for r in returns if r > 0]
     neg_returns = [r for r in returns if r < 0]
@@ -53,6 +60,16 @@ def calculate_metrics(
         dd = (value / peak) - 1
         if dd < max_drawdown:
             max_drawdown = dd
+
+    periods = max(1, len(equity_curve) - 1)
+    if equity_curve[-1] > 0:
+        annualized_log_return = math.log(equity_curve[-1]) * periods_per_year / periods
+        # Tiny intraday samples can annualise to an absurd number; keep report
+        # serialization finite while preserving the ordering signal.
+        cagr = math.expm1(min(annualized_log_return, math.log(1_000_001)))
+    else:
+        cagr = -1.0
+    calmar = cagr / abs(max_drawdown) if max_drawdown < 0 else 0.0
             
     return {
         "total_return": round(equity_curve[-1] - 1, 6),
@@ -61,4 +78,7 @@ def calculate_metrics(
         "trade_count": float(trade_count),
         "win_rate": round(win_rate, 4),
         "profit_factor": round(profit_factor, 4),
+        "cagr": round(cagr, 6),
+        "sortino_ratio": round(sortino, 4),
+        "calmar_ratio": round(calmar, 4),
     }

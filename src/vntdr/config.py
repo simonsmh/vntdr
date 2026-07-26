@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping
 
 from dotenv import dotenv_values
 from pydantic import BaseModel, Field, SecretStr
@@ -77,8 +77,12 @@ class ResearchSettings(BaseModel):
     maker_fee_rate: float = 0.0002  # Maker 手续费率，默认 0.02%
     taker_fee_rate: float = 0.0005  # Taker 手续费率，默认 0.05%
     use_maker_fee: bool = False  # 是否使用 maker 费率（默认使用 taker）
+    slippage_bps: float = Field(default=0.0, ge=0.0)
+    spread_bps: float = Field(default=0.0, ge=0.0)
+    funding_rate_per_bar: float = Field(default=0.0, ge=0.0)
     optimize_target: str = "sharpe"  # 寻优打分排序指标，可选: sharpe (夏普比率) / return (收益率)
     trade_mode: str = "both"  # 交易模式，可选: both (多空双开) / long_only (只算多仓) / short_only (只算空仓)
+    execution_mode: Literal["notify_only", "paper", "live"] = "notify_only"
     strategy_parameters: dict[str, dict[str, Any]] = Field(default_factory=dict)
     monitored_targets: list[dict[str, Any]] = Field(default_factory=list)
 
@@ -156,8 +160,12 @@ class Settings(BaseModel):
                 maker_fee_rate=float(mapping.get("VNTDR_MAKER_FEE_RATE", "0.0002")),
                 taker_fee_rate=float(mapping.get("VNTDR_TAKER_FEE_RATE", "0.0005")),
                 use_maker_fee=_to_bool(mapping.get("VNTDR_USE_MAKER_FEE", "false")),
+                slippage_bps=float(mapping.get("VNTDR_SLIPPAGE_BPS", "0")),
+                spread_bps=float(mapping.get("VNTDR_SPREAD_BPS", "0")),
+                funding_rate_per_bar=float(mapping.get("VNTDR_FUNDING_RATE_PER_BAR", "0")),
                 optimize_target=mapping.get("VNTDR_OPTIMIZE_TARGET", "sharpe"),
                 trade_mode=mapping.get("VNTDR_TRADE_MODE", "both"),
+                execution_mode=mapping.get("VNTDR_EXECUTION_MODE", "notify_only").lower(),
             ),
             risk=RiskSettings(
                 max_strategy_capital=float(mapping.get("VNTDR_MAX_STRATEGY_CAPITAL", "0.30")),

@@ -269,5 +269,5 @@ def test_backtest_fee_rate_affects_total_return_and_step_metrics(
 
     gross_return = bars[-1].close / bars[0].close - 1
     assert outcome.metrics["total_return"] < gross_return
-    assert outcome.metrics["trade_count"] == 2.0
+    assert outcome.metrics["trade_count"] == 1.0
     assert outcome.metrics["win_rate"] < 1.0

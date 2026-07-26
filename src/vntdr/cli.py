@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import importlib
+import json
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Any
+from uuid import UUID
 
 import redis
 import typer
@@ -14,14 +16,23 @@ from vntdr.adapters.orders import OkxOrderExecutor, SimulatedOrderExecutor
 from vntdr.adapters.state import RedisSignalStore
 from vntdr.adapters.telegram import TelegramNotifier
 from vntdr.config import Settings
-from vntdr.models import HealthCheckResult, MonitorResult, ResearchJobConfig, SyncResult
+from vntdr.models import (
+    HealthCheckResult, Instrument, Interval, MonitorResult, ResearchJobConfig, ShadowRun,
+    StrategyActivation, StrategyInstance, StrategyVersion, SyncResult,
+)
 from vntdr.services.history import HistorySyncService, OkxHistoryClient
+from vntdr.services.tradingview_history import TradingViewHistoryClient
+from vntdr.services.external_factors import OkxDerivativesProvider
+from vntdr.services.factor_sync import FactorSyncService
+from vntdr.services.governance import StrategyGovernanceService
 from vntdr.services.monitoring import MonitoringService
+from vntdr.services.portfolio_runtime import PortfolioRuntimeService
 from vntdr.services.research import ResearchService
 from vntdr.services.risk import RiskManager
+from vntdr.services.strategy_runtime import StrategyRuntimeService
 from vntdr.services.telegram_research import TelegramResearchService
 from vntdr.storage.database import Database
-from vntdr.storage.repositories import MarketDataRepository, ResearchRunRepository
+from vntdr.storage.repositories import MarketDataRepository, ResearchRunRepository, StrategyRepository
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
 
@@ -48,6 +59,7 @@ class CommandContext:
         self.database.create_schema()
         self.market_data_repository = MarketDataRepository(self.database)
         self.research_run_repository = ResearchRunRepository(self.database)
+        self.strategy_repository = StrategyRepository(self.database)
         import threading
         self._runtime_config_lock = threading.Lock()
         self.history_service = HistorySyncService(
@@ -60,6 +72,7 @@ class CommandContext:
             settings=settings,
             market_data_repository=self.market_data_repository,
             research_run_repository=self.research_run_repository,
+            factor_repository=self.strategy_repository,
         )
         redis_client = redis.from_url(settings.redis.url)
         order_executor = self._build_order_executor(settings)
@@ -73,6 +86,13 @@ class CommandContext:
             order_executor=order_executor,
             signal_store=RedisSignalStore(redis_client),
             risk_manager=RiskManager(settings.risk),
+        )
+        self.strategy_runtime = StrategyRuntimeService(self.strategy_repository)
+        self.strategy_governance = StrategyGovernanceService(self.strategy_repository)
+        self.portfolio_runtime = PortfolioRuntimeService(
+            strategy_repository=self.strategy_repository,
+            strategy_runtime=self.strategy_runtime,
+            monitoring_service=self.monitoring_service,
         )
         self._okx_runtime_signature = self._okx_runtime_config_signature(settings)
         self.telegram_research_service = TelegramResearchService(
@@ -176,8 +196,78 @@ class CommandContext:
     def walk_forward(self, config: ResearchJobConfig):
         return self.research_service.walk_forward(config)
 
+    def validate_candidate(self, *, backtest_config: ResearchJobConfig, walk_forward_config: ResearchJobConfig):
+        return self.research_service.validate_candidate(
+            backtest_config=backtest_config,
+            walk_forward_config=walk_forward_config,
+        )
+
+    def factor_ablation(self, config: ResearchJobConfig, variants: dict[str, dict[str, Any]]):
+        return self.research_service.factor_ablation(config, variants)
+
     def telegram_research(self) -> TelegramResearchService:
         return self.telegram_research_service
+
+    def create_strategy_instance(
+        self, *, name: str, strategy_name: str, symbol: str, exchange: str,
+        asset_class: str, interval: str, execution_mode: str = "notify_only",
+        parameters: dict[str, Any] | None = None,
+        auxiliary_intervals: list[str] | None = None,
+    ) -> tuple[StrategyInstance, StrategyVersion]:
+        # Ensure a misspelled plugin cannot be persisted as an executable instance.
+        self.research_service._load_strategy(strategy_name)
+        instance = self.strategy_repository.create_instance(StrategyInstance(
+            name=name, instrument=Instrument(symbol=symbol, exchange=exchange, asset_class=asset_class),
+            primary_interval=Interval(value=interval),
+            auxiliary_intervals=[Interval(value=value) for value in (auxiliary_intervals or [])],
+            execution_mode=execution_mode,
+        ))
+        version = self.strategy_repository.create_version(StrategyVersion(
+            strategy_name=strategy_name, parameters=parameters or self.research_service.default_parameters(strategy_name),
+        ))
+        return instance, version
+
+    def approve_strategy_version(
+        self,
+        *,
+        instance_id: UUID,
+        version_id: UUID,
+        approved_by: str,
+        backtest_passed: bool,
+        walk_forward_passed: bool,
+        shadow_passed: bool,
+        max_drawdown: float | None,
+    ) -> StrategyActivation:
+        from vntdr.models import ValidationGate
+        return self.strategy_governance.approve_activation(
+            instance_id=instance_id,
+            version_id=version_id,
+            effective_at=datetime.now().astimezone(),
+            approved_by=approved_by,
+            validation=ValidationGate(
+                backtest_passed=backtest_passed,
+                walk_forward_passed=walk_forward_passed,
+                shadow_passed=shadow_passed,
+                max_drawdown=max_drawdown,
+            ),
+        )
+
+    def rollback_strategy_version(
+        self, *, instance_id: UUID, target_version_id: UUID, approved_by: str
+    ) -> StrategyActivation:
+        return self.strategy_governance.rollback(
+            instance_id=instance_id,
+            target_version_id=target_version_id,
+            effective_at=datetime.now().astimezone(),
+            approved_by=approved_by,
+        )
+
+    def run_portfolio_once(self, *, volume: float | None = None):
+        self.refresh_runtime_config()
+        return self.portfolio_runtime.run_enabled(
+            volume=volume if volume is not None else self.settings.research.default_order_size,
+            lookback_bars=self.settings.research.monitor_lookback_bars,
+        )
 
     def monitor_once(
         self,
@@ -226,6 +316,156 @@ def create_command_context(settings: Settings) -> CommandContext:
     return CommandContext(settings)
 
 
+@app.command("strategy-create")
+def strategy_create_command(
+    name: str = typer.Option(...),
+    strategy: str = typer.Option(...),
+    symbol: str = typer.Option(...),
+    interval: str = typer.Option(...),
+    exchange: str = typer.Option("OKX"),
+    asset_class: str = typer.Option("crypto"),
+    execution_mode: str = typer.Option("notify_only"),
+    auxiliary_interval: list[str] = typer.Option([], "--aux-interval", help="可重复，例如 --aux-interval 1d"),
+) -> None:
+    """Register a versioned strategy instance; safe notification-only by default."""
+    settings = Settings.from_env()
+    settings.validate_for("backtest")
+    instance, version = create_command_context(settings).create_strategy_instance(
+        name=name, strategy_name=strategy, symbol=symbol, exchange=exchange,
+        asset_class=asset_class, interval=interval, execution_mode=execution_mode,
+        auxiliary_intervals=auxiliary_interval,
+    )
+    typer.echo(f"strategy instance created: {instance.id} ({instance.name})")
+    typer.echo(f"pending approval version: {version.id}")
+
+
+@app.command("strategy-approve")
+def strategy_approve_command(
+    instance_id: str = typer.Option(...),
+    version_id: str = typer.Option(...),
+    approved_by: str = typer.Option(...),
+    backtest_run_id: int = typer.Option(..., help="已完成的回测研究运行 ID"),
+    walk_forward_run_id: int = typer.Option(..., help="已完成的走查研究运行 ID"),
+    shadow_run_id: str | None = typer.Option(None, help="已完成且通过的影子运行 ID"),
+) -> None:
+    """Approve a validated version for activation on its next runtime check."""
+    settings = Settings.from_env()
+    settings.validate_for("backtest")
+    context = create_command_context(settings)
+    instance = context.strategy_repository.get_instance(instance_id)
+    if instance is None:
+        raise typer.BadParameter("unknown strategy instance")
+    with context.database.session() as session:
+        from vntdr.storage.database import StrategyVersionORM
+        version_row = session.get(StrategyVersionORM, version_id)
+    if version_row is None:
+        raise typer.BadParameter("unknown strategy version")
+    expected = (version_row.strategy_name, instance.instrument.symbol, instance.primary_interval.value)
+    evidence = []
+    for run_id, expected_mode in ((backtest_run_id, "backtest"), (walk_forward_run_id, "walk-forward")):
+        found = context.research_run_repository.get_research_run(run_id)
+        if found is None:
+            raise typer.BadParameter(f"unknown research run: {run_id}")
+        report, _, status = found
+        if status != "completed" or report.mode != expected_mode:
+            raise typer.BadParameter(f"research run {run_id} is not a completed {expected_mode} run")
+        if (report.strategy_name, report.symbol, report.interval) != expected:
+            raise typer.BadParameter(f"research run {run_id} does not match the instance/version dataset")
+        evidence.append(report)
+    backtest, walk_forward = evidence
+    if backtest.metrics.get("trade_count", 0) < 10:
+        raise typer.BadParameter("backtest evidence has fewer than 10 trades")
+    if (len(walk_forward.fold_results) < 3 or walk_forward.metrics.get("total_return", 0) <= 0
+            or walk_forward.metrics.get("max_drawdown", 0) < -0.10):
+        raise typer.BadParameter("walk-forward evidence does not pass folds, return, or drawdown gates")
+    if not shadow_run_id:
+        raise typer.BadParameter("--shadow-run-id is required; a boolean flag is not shadow evidence")
+    shadow = context.strategy_repository.get_shadow_run(shadow_run_id)
+    if shadow is None or shadow.status != "passed":
+        raise typer.BadParameter("shadow run must exist and have status=passed")
+    if shadow.instance_id != UUID(instance_id) or shadow.strategy_version_id != UUID(version_id):
+        raise typer.BadParameter("shadow run must belong to the instance and version being approved")
+    activation = context.approve_strategy_version(
+        instance_id=UUID(instance_id), version_id=UUID(version_id), approved_by=approved_by,
+        backtest_passed=True, walk_forward_passed=True,
+        shadow_passed=True, max_drawdown=shadow.max_drawdown,
+    )
+    typer.echo(f"strategy version activated: {activation.strategy_version_id}")
+
+
+@app.command("strategy-rollback")
+def strategy_rollback_command(
+    instance_id: str = typer.Option(...),
+    target_version_id: str = typer.Option(...),
+    approved_by: str = typer.Option(...),
+) -> None:
+    """Roll back an instance to a previously approved version."""
+    settings = Settings.from_env()
+    settings.validate_for("backtest")
+    activation = create_command_context(settings).rollback_strategy_version(
+        instance_id=UUID(instance_id), target_version_id=UUID(target_version_id), approved_by=approved_by,
+    )
+    typer.echo(f"rolled back to version: {activation.strategy_version_id}")
+
+
+@app.command("shadow-start")
+def shadow_start_command(
+    instance_id: str = typer.Option(...),
+    version_id: str = typer.Option(...),
+    initial_equity: float = typer.Option(1.0),
+) -> None:
+    """Start an auditable notification-only observation run for one version."""
+    settings = Settings.from_env()
+    settings.validate_for("backtest")
+    run = create_command_context(settings).strategy_repository.create_shadow_run(ShadowRun(
+        instance_id=UUID(instance_id), strategy_version_id=UUID(version_id), initial_equity=initial_equity,
+    ))
+    typer.echo(f"shadow run started: {run.id}")
+
+
+@app.command("shadow-record-equity")
+def shadow_record_equity_command(
+    shadow_run_id: str = typer.Option(...),
+    equity: float = typer.Option(...),
+    observed_at: str | None = typer.Option(None),
+) -> None:
+    """Append a marked-to-market equity observation to an active shadow run."""
+    settings = Settings.from_env()
+    settings.validate_for("backtest")
+    at = datetime.fromisoformat(observed_at) if observed_at else datetime.now().astimezone()
+    run = create_command_context(settings).strategy_repository.record_shadow_equity(
+        shadow_run_id, equity, at,
+    )
+    typer.echo(f"shadow observations={run.observation_count} drawdown={run.max_drawdown:.2%}")
+
+
+@app.command("shadow-finish")
+def shadow_finish_command(
+    shadow_run_id: str = typer.Option(...),
+    status: str = typer.Option(..., help="passed or failed"),
+) -> None:
+    """Finalize a shadow run after its externally reviewed observation period."""
+    settings = Settings.from_env()
+    settings.validate_for("backtest")
+    run = create_command_context(settings).strategy_repository.finalize_shadow_run(shadow_run_id, status)
+    typer.echo(f"shadow run {run.id}: {run.status}, drawdown={run.max_drawdown:.2%}")
+
+
+@app.command("portfolio-run")
+def portfolio_run_command(volume: float | None = typer.Option(None)) -> None:
+    """Run all enabled versioned instances and print the notification-only target portfolio."""
+    settings = Settings.from_env()
+    settings.validate_for("live")
+    result = create_command_context(settings).run_portfolio_once(volume=volume)
+    typer.echo(f"gross={result.portfolio.gross_exposure:.4f} net={result.portfolio.net_exposure:.4f}")
+    for symbol, weight in result.portfolio.target_weights.items():
+        typer.echo(f"{symbol}: {weight:.4f}")
+    for reason in result.portfolio.scaling_reasons:
+        typer.echo(f"scaled: {reason}")
+    for instance, error in result.errors.items():
+        typer.echo(f"error {instance}: {error}")
+
+
 def run() -> None:
     app()
 
@@ -253,6 +493,7 @@ def sync_history_command(
     start: str = typer.Option(...),
     end: str = typer.Option(...),
     fill_missing: bool = typer.Option(False),
+    calendar: str = typer.Option("continuous", help="continuous 或 weekday"),
 ) -> None:
     settings = Settings.from_env()
     settings.validate_for("sync-history")
@@ -263,6 +504,7 @@ def sync_history_command(
         start=datetime.fromisoformat(start),
         end=datetime.fromisoformat(end),
         fill_missing=fill_missing,
+        calendar=calendar,
     )
     typer.echo(
         f"sync job={result.job_id} inserted={result.inserted_count} cleaned={result.cleaned_count} "
@@ -270,10 +512,73 @@ def sync_history_command(
     )
 
 
+@app.command("sync-tradingview")
+def sync_tradingview_command(
+    tradingview_symbol: str = typer.Option(..., "--tv-symbol", help="例如 OANDA:XAUUSD"),
+    output_symbol: str = typer.Option(..., help="必须以 TV: 开头，例如 TV:XAUUSD"),
+    interval: str = typer.Option(...),
+    start: str = typer.Option(...),
+    end: str = typer.Option(...),
+    fill_missing: bool = typer.Option(False),
+    extended_session: bool = typer.Option(False),
+    calendar: str = typer.Option("weekday", help="TradingView 代理默认按交易日市场处理"),
+) -> None:
+    """通过 TradingView 非官方 WebSocket 拉取隔离的研究代理行情。"""
+    settings = Settings.from_env()
+    settings.validate_for("sync-history")
+    context = create_command_context(settings)
+    service = HistorySyncService(
+        settings=settings,
+        history_client=TradingViewHistoryClient(
+            tradingview_symbol=tradingview_symbol,
+            output_symbol=output_symbol,
+            auth_token=os.getenv("TRADINGVIEW_AUTH_TOKEN"),
+            extended_session=extended_session,
+        ),
+        market_data_repository=context.market_data_repository,
+        research_run_repository=context.research_run_repository,
+    )
+    result = service.sync(
+        symbol=output_symbol,
+        interval=interval,
+        start=datetime.fromisoformat(start),
+        end=datetime.fromisoformat(end),
+        fill_missing=fill_missing,
+        calendar=calendar,
+    )
+    typer.echo(
+        f"TradingView research sync job={result.job_id} symbol={output_symbol} "
+        f"inserted={result.inserted_count} cleaned={result.cleaned_count} "
+        f"duplicates={result.duplicates_removed}"
+    )
+
+
+@app.command("sync-okx-derivatives")
+def sync_okx_derivatives_command(
+    symbol: str = typer.Option(...),
+    asset_class: str = typer.Option("crypto"),
+    start: str = typer.Option(...),
+    end: str = typer.Option(...),
+) -> None:
+    """Sync public OKX funding/open-interest observations for factor research."""
+    settings = Settings.from_env()
+    settings.validate_for("sync-history")
+    context = create_command_context(settings)
+    instrument = Instrument(symbol=symbol, exchange="OKX", asset_class=asset_class)
+    count = FactorSyncService(repository=context.strategy_repository).sync(
+        provider=OkxDerivativesProvider(base_url=settings.okx.rest_base_url),
+        instrument=instrument,
+        start=datetime.fromisoformat(start),
+        end=datetime.fromisoformat(end),
+    )
+    typer.echo(f"OKX derivative factors synced: {count} observations for {symbol}")
+
+
 def _build_research_config(
     *,
     strategy: str,
     symbol: str,
+    exchange: str | None,
     interval: str,
     start: str,
     end: str,
@@ -282,10 +587,13 @@ def _build_research_config(
     parameter_space: dict[str, list[Any]] | None = None,
     train_window: int | None = None,
     test_window: int | None = None,
+    auxiliary_intervals: list[str] | None = None,
+    optimize_target: str = "sharpe",
 ) -> ResearchJobConfig:
     return ResearchJobConfig(
         strategy_name=strategy,
         symbol=symbol,
+        exchange=exchange,
         interval=interval,
         start=datetime.fromisoformat(start),
         end=datetime.fromisoformat(end),
@@ -294,6 +602,8 @@ def _build_research_config(
         parameter_space=parameter_space or {},
         train_window=train_window,
         test_window=test_window,
+        auxiliary_intervals=auxiliary_intervals or [],
+        optimize_target=optimize_target,
     )
 
 
@@ -301,9 +611,11 @@ def _build_research_config(
 def backtest_command(
     strategy: str = typer.Option(...),
     symbol: str = typer.Option(...),
+    exchange: str | None = typer.Option(None, help="数据源交易所，例如 TRADINGVIEW 或 OKX"),
     interval: str = typer.Option(...),
     start: str = typer.Option(..., "--from"),
     end: str = typer.Option(..., "--to"),
+    auxiliary_interval: list[str] = typer.Option([], "--aux-interval"),
 ) -> None:
     settings = Settings.from_env()
     settings.validate_for("backtest")
@@ -312,11 +624,13 @@ def backtest_command(
         _build_research_config(
             strategy=strategy,
             symbol=symbol,
+            exchange=exchange,
             interval=interval,
             start=start,
             end=end,
             mode="backtest",
             parameters=context.research_service.default_parameters(strategy),
+            auxiliary_intervals=auxiliary_interval,
         )
     )
     typer.echo(report.to_markdown())
@@ -326,10 +640,12 @@ def backtest_command(
 def optimize_command(
     strategy: str = typer.Option(...),
     symbol: str = typer.Option(...),
+    exchange: str | None = typer.Option(None, help="数据源交易所，例如 TRADINGVIEW 或 OKX"),
     interval: str = typer.Option(...),
     start: str = typer.Option(..., "--from"),
     end: str = typer.Option(..., "--to"),
     method: str = typer.Option("ga"),
+    auxiliary_interval: list[str] = typer.Option([], "--aux-interval"),
 ) -> None:
     settings = Settings.from_env()
     settings.validate_for("optimize")
@@ -338,11 +654,13 @@ def optimize_command(
         _build_research_config(
             strategy=strategy,
             symbol=symbol,
+            exchange=exchange,
             interval=interval,
             start=start,
             end=end,
             mode="optimize",
             parameter_space=context.research_service.default_parameter_space(strategy),
+            auxiliary_intervals=auxiliary_interval,
         ),
         method=method,
     )
@@ -353,11 +671,13 @@ def optimize_command(
 def walk_forward_command(
     strategy: str = typer.Option(...),
     symbol: str = typer.Option(...),
+    exchange: str | None = typer.Option(None, help="数据源交易所，例如 TRADINGVIEW 或 OKX"),
     interval: str = typer.Option(...),
     start: str = typer.Option(..., "--from"),
     end: str = typer.Option(..., "--to"),
     train_window: int = typer.Option(...),
     test_window: int = typer.Option(...),
+    auxiliary_interval: list[str] = typer.Option([], "--aux-interval"),
 ) -> None:
     settings = Settings.from_env()
     settings.validate_for("walk-forward")
@@ -366,6 +686,7 @@ def walk_forward_command(
         _build_research_config(
             strategy=strategy,
             symbol=symbol,
+            exchange=exchange,
             interval=interval,
             start=start,
             end=end,
@@ -373,9 +694,112 @@ def walk_forward_command(
             parameter_space=context.research_service.default_parameter_space(strategy),
             train_window=train_window,
             test_window=test_window,
+            auxiliary_intervals=auxiliary_interval,
         )
     )
     typer.echo(report.to_markdown())
+
+
+@app.command("ablate-strategy")
+def ablate_strategy_command(
+    strategy: str = typer.Option(...),
+    symbol: str = typer.Option(...),
+    interval: str = typer.Option(...),
+    start: str = typer.Option(..., "--from"),
+    end: str = typer.Option(..., "--to"),
+    variant: list[str] = typer.Option(..., help='Repeat NAME={"parameter": value}; each uses identical data.'),
+    parameters_json: str = typer.Option("{}", help="Baseline parameter JSON"),
+    exchange: str | None = typer.Option(None),
+    auxiliary_interval: list[str] = typer.Option([], "--aux-interval"),
+) -> None:
+    """Run explicit, reproducible factor ablations without re-optimizing variants."""
+    try:
+        parameters = json.loads(parameters_json)
+        variants = {
+            item.split("=", 1)[0]: json.loads(item.split("=", 1)[1])
+            for item in variant
+            if "=" in item
+        }
+    except (json.JSONDecodeError, IndexError) as exc:
+        raise typer.BadParameter("variants must be NAME={\"parameter\": value}") from exc
+    if not variants or any(not name or not isinstance(values, dict) for name, values in variants.items()):
+        raise typer.BadParameter("provide at least one valid NAME={...} variant")
+    settings = Settings.from_env()
+    settings.validate_for("backtest")
+    result = create_command_context(settings).factor_ablation(
+        _build_research_config(
+            strategy=strategy, symbol=symbol, exchange=exchange, interval=interval,
+            start=start, end=end, mode="backtest", parameters=parameters,
+            auxiliary_intervals=auxiliary_interval,
+        ),
+        variants,
+    )
+    for row in result.variants:
+        metrics = row["metrics"]
+        typer.echo(
+            f"{row['name']}: return={metrics.get('total_return', 0):.4%} "
+            f"drawdown={metrics.get('max_drawdown', 0):.4%} trades={metrics.get('trade_count', 0):.0f}"
+        )
+
+
+@app.command("validate-strategy")
+def validate_strategy_command(
+    strategy: str = typer.Option(...),
+    symbol: str = typer.Option(...),
+    interval: str = typer.Option(...),
+    start: str = typer.Option(..., "--from"),
+    end: str = typer.Option(..., "--to"),
+    exchange: str | None = typer.Option(None),
+    train_window: int = typer.Option(...),
+    test_window: int = typer.Option(...),
+    auxiliary_interval: list[str] = typer.Option([], "--aux-interval"),
+    fixed_parameters_json: str = typer.Option("{}", help="固定在回测及每个走查折中的参数 JSON"),
+) -> None:
+    """Run backtest plus walk-forward gates used before version approval."""
+    settings = Settings.from_env()
+    settings.validate_for("walk-forward")
+    context = create_command_context(settings)
+    try:
+        fixed_parameters = json.loads(fixed_parameters_json)
+    except json.JSONDecodeError as exc:
+        raise typer.BadParameter("--fixed-parameters-json must be a JSON object") from exc
+    if not isinstance(fixed_parameters, dict):
+        raise typer.BadParameter("--fixed-parameters-json must be a JSON object")
+    common = {
+        "strategy": strategy,
+        "symbol": symbol,
+        "exchange": exchange,
+        "interval": interval,
+        "start": start,
+        "end": end,
+        "auxiliary_intervals": auxiliary_interval,
+    }
+    result = context.validate_candidate(
+        backtest_config=_build_research_config(
+            **common,
+            mode="backtest",
+            parameters={**context.research_service.default_parameters(strategy), **fixed_parameters},
+        ),
+        walk_forward_config=_build_research_config(
+            **common,
+            mode="walk-forward",
+            parameter_space={
+                **context.research_service.default_parameter_space(strategy),
+                **{name: [value] for name, value in fixed_parameters.items()},
+            },
+            train_window=train_window,
+            test_window=test_window,
+            # Approval is governed by sample-out-of-sample return, not the
+            # in-sample Sharpe proxy used by exploratory research screens.
+            optimize_target="return",
+        ),
+    )
+    typer.echo(f"validation={'passed' if result.passed else 'failed'}")
+    for reason in result.reasons:
+        typer.echo(f"- {reason}")
+    typer.echo(result.walk_forward.to_markdown())
+    if not result.passed:
+        raise typer.Exit(code=1)
 
 
 def sync_target_market_data(context, sym, inv, logger) -> None:

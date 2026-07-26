@@ -4,7 +4,7 @@ from contextlib import contextmanager
 from datetime import datetime
 from typing import Iterator
 
-from sqlalchemy import JSON, Boolean, DateTime, Float, Integer, String, create_engine, text
+from sqlalchemy import JSON, Boolean, DateTime, Float, Integer, String, UniqueConstraint, create_engine, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 
@@ -71,6 +71,78 @@ class WalkForwardFoldORM(Base):
     test_end: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     metrics: Mapped[dict] = mapped_column(JSON, default=dict)
     parameters: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class StrategyVersionORM(Base):
+    __tablename__ = "strategy_versions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    strategy_name: Mapped[str] = mapped_column(String(128), index=True)
+    parameters: Mapped[dict] = mapped_column(JSON, default=dict)
+    factor_config: Mapped[dict] = mapped_column(JSON, default=dict)
+    code_version: Mapped[str] = mapped_column(String(128), default="local")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    parent_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+
+
+class StrategyInstanceORM(Base):
+    __tablename__ = "strategy_instances"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    name: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    symbol: Mapped[str] = mapped_column(String(64), index=True)
+    exchange: Mapped[str] = mapped_column(String(32))
+    asset_class: Mapped[str] = mapped_column(String(32))
+    calendar: Mapped[str] = mapped_column(String(32), default="continuous")
+    quote_currency: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    primary_interval: Mapped[str] = mapped_column(String(16))
+    auxiliary_intervals: Mapped[list] = mapped_column(JSON, default=list)
+    execution_mode: Mapped[str] = mapped_column(String(32), default="notify_only")
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+class StrategyActivationORM(Base):
+    __tablename__ = "strategy_activations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    instance_id: Mapped[str] = mapped_column(String(36), index=True)
+    strategy_version_id: Mapped[str] = mapped_column(String(36), index=True)
+    effective_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    approved_by: Mapped[str] = mapped_column(String(128), default="system")
+    rollback_of: Mapped[str | None] = mapped_column(String(36), nullable=True)
+
+
+class ShadowRunORM(Base):
+    __tablename__ = "shadow_runs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    instance_id: Mapped[str] = mapped_column(String(36), index=True)
+    strategy_version_id: Mapped[str] = mapped_column(String(36), index=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    last_observed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    initial_equity: Mapped[float] = mapped_column(Float, default=1.0)
+    current_equity: Mapped[float] = mapped_column(Float, default=1.0)
+    peak_equity: Mapped[float] = mapped_column(Float, default=1.0)
+    max_drawdown: Mapped[float] = mapped_column(Float, default=0.0)
+    observation_count: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[str] = mapped_column(String(16), default="active")
+
+
+class FactorObservationORM(Base):
+    __tablename__ = "factor_observations"
+    __table_args__ = (
+        UniqueConstraint("symbol", "exchange", "factor_name", "observed_at", "interval", name="uq_factor_observation"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    symbol: Mapped[str] = mapped_column(String(64), index=True)
+    exchange: Mapped[str] = mapped_column(String(32))
+    factor_name: Mapped[str] = mapped_column(String(128), index=True)
+    value: Mapped[float] = mapped_column(Float)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    interval: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
 class Database:

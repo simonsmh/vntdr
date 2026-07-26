@@ -4,6 +4,7 @@ import json
 from datetime import datetime, timezone
 from statistics import mean
 from typing import Any, Literal
+from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -36,6 +37,206 @@ class BarRecord(BaseModel):
         return (self.symbol, self.exchange, self.interval, self.datetime)
 
 
+class Instrument(BaseModel):
+    """A tradable or research-only instrument, independent of a venue's symbol syntax."""
+
+    symbol: str
+    exchange: str
+    asset_class: Literal["crypto", "commodity", "equity", "fx", "index"] = "crypto"
+    calendar: Literal["continuous", "weekday"] = "continuous"
+    quote_currency: str | None = None
+
+    @field_validator("symbol", "exchange")
+    @classmethod
+    def normalize_identifier(cls, value: str) -> str:
+        return value.strip().upper()
+
+
+class Interval(BaseModel):
+    """Normalised bar interval with a single canonical spelling."""
+
+    value: str
+
+    @field_validator("value")
+    @classmethod
+    def normalize_value(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        aliases = {"d": "1d", "day": "1d", "h": "1h", "hour": "1h", "min": "1m"}
+        normalized = aliases.get(normalized, normalized)
+        import re
+        if not re.fullmatch(r"[1-9]\d*[mhdw]", normalized):
+            raise ValueError("interval must look like 15m, 4h, 1d, or 1w")
+        return normalized
+
+    @property
+    def seconds(self) -> int:
+        unit_seconds = {"m": 60, "h": 3600, "d": 86400, "w": 604800}
+        return int(self.value[:-1]) * unit_seconds[self.value[-1]]
+
+
+class StrategyVersion(BaseModel):
+    """Immutable snapshot of executable strategy code/configuration."""
+
+    id: UUID = Field(default_factory=uuid4)
+    strategy_name: str
+    parameters: dict[str, Any] = Field(default_factory=dict)
+    factor_config: dict[str, Any] = Field(default_factory=dict)
+    code_version: str = "local"
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    parent_id: UUID | None = None
+
+    @field_validator("created_at")
+    @classmethod
+    def normalize_created_at(cls, value: datetime) -> datetime:
+        return _ensure_utc(value)
+
+    def clone(self, *, parameters: dict[str, Any] | None = None, factor_config: dict[str, Any] | None = None) -> "StrategyVersion":
+        return StrategyVersion(
+            strategy_name=self.strategy_name,
+            parameters=parameters if parameters is not None else self.parameters,
+            factor_config=factor_config if factor_config is not None else self.factor_config,
+            code_version=self.code_version,
+            parent_id=self.id,
+        )
+
+
+class StrategyInstance(BaseModel):
+    id: UUID = Field(default_factory=uuid4)
+    name: str
+    instrument: Instrument
+    primary_interval: Interval
+    auxiliary_intervals: list[Interval] = Field(default_factory=list)
+    execution_mode: Literal["notify_only", "paper", "live"] = "notify_only"
+    enabled: bool = True
+
+
+class StrategyActivation(BaseModel):
+    instance_id: UUID
+    strategy_version_id: UUID
+    effective_at: datetime
+    approved_by: str = "system"
+    rollback_of: UUID | None = None
+
+    @field_validator("effective_at")
+    @classmethod
+    def normalize_effective_at(cls, value: datetime) -> datetime:
+        return _ensure_utc(value)
+
+
+class ValidationGate(BaseModel):
+    backtest_passed: bool = False
+    walk_forward_passed: bool = False
+    shadow_passed: bool = False
+    max_drawdown: float | None = None
+
+    @property
+    def approved(self) -> bool:
+        return self.backtest_passed and self.walk_forward_passed and self.shadow_passed
+
+
+class ShadowRun(BaseModel):
+    """Auditable notification-only observation period for one strategy version."""
+
+    id: UUID = Field(default_factory=uuid4)
+    instance_id: UUID
+    strategy_version_id: UUID
+    started_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    last_observed_at: datetime | None = None
+    initial_equity: float = 1.0
+    current_equity: float = 1.0
+    peak_equity: float = 1.0
+    max_drawdown: float = 0.0
+    observation_count: int = 0
+    status: Literal["active", "passed", "failed"] = "active"
+
+    @field_validator("started_at", "last_observed_at")
+    @classmethod
+    def normalize_times(cls, value: datetime | None) -> datetime | None:
+        return _ensure_utc(value) if value is not None else value
+
+
+class FactorObservation(BaseModel):
+    instrument: Instrument
+    factor_name: str
+    value: float
+    observed_at: datetime
+    available_at: datetime
+    interval: Interval | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("observed_at", "available_at")
+    @classmethod
+    def normalize_factor_dates(cls, value: datetime) -> datetime:
+        return _ensure_utc(value)
+
+    @model_validator(mode="after")
+    def validate_availability(self) -> "FactorObservation":
+        if self.available_at < self.observed_at:
+            raise ValueError("available_at cannot be earlier than observed_at")
+        return self
+
+
+class StrategyDecision(BaseModel):
+    strategy_instance_id: UUID
+    instrument: Instrument
+    signal: float = Field(ge=-1.0, le=1.0)
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    reason: str = ""
+
+    @field_validator("created_at")
+    @classmethod
+    def normalize_decision_time(cls, value: datetime) -> datetime:
+        return _ensure_utc(value)
+
+
+class PortfolioDecision(BaseModel):
+    target_weights: dict[str, float] = Field(default_factory=dict)
+    gross_exposure: float = 0.0
+    net_exposure: float = 0.0
+    scaling_reasons: list[str] = Field(default_factory=list)
+
+
+class PortfolioRunResult(BaseModel):
+    decisions: list[StrategyDecision] = Field(default_factory=list)
+    portfolio: PortfolioDecision = Field(default_factory=PortfolioDecision)
+    errors: dict[str, str] = Field(default_factory=dict)
+
+
+class ResearchValidationResult(BaseModel):
+    """Objective evidence used before a strategy version is approved."""
+
+    backtest: "ResearchReport"
+    walk_forward: "ResearchReport"
+    passed: bool
+    reasons: list[str] = Field(default_factory=list)
+    max_drawdown_limit: float
+    minimum_fold_count: int
+
+
+class PositionSizingDecision(BaseModel):
+    units: float
+    notional: float
+    risk_budget: float
+    stop_distance: float
+    capped: bool = False
+
+
+class DataQualityReport(BaseModel):
+    interval: Interval
+    checked_at: datetime
+    bar_count: int
+    gaps_detected: int = 0
+    stale: bool = False
+    usable: bool = False
+    reason: str | None = None
+
+    @field_validator("checked_at")
+    @classmethod
+    def normalize_checked_at(cls, value: datetime) -> datetime:
+        return _ensure_utc(value)
+
+
 class CleanBarsResult(BaseModel):
     bars: list[BarRecord]
     duplicates_removed: int = 0
@@ -59,6 +260,26 @@ class OrderInstruction(BaseModel):
     reason: str
 
 
+class TradeRecord(BaseModel):
+    """A completed, cost-inclusive trade produced by the event-driven backtest."""
+
+    direction: Literal["long", "short"]
+    entry_time: datetime
+    exit_time: datetime
+    entry_price: float
+    exit_price: float
+    gross_return: float
+    net_return: float
+    bars_held: int
+    transaction_cost: float = 0.0
+    funding_cost: float = 0.0
+
+    @field_validator("entry_time", "exit_time")
+    @classmethod
+    def normalize_trade_dates(cls, value: datetime) -> datetime:
+        return _ensure_utc(value)
+
+
 class MonitorResult(BaseModel):
     symbol: str
     interval: str
@@ -69,6 +290,7 @@ class MonitorResult(BaseModel):
     actions: list[str] = Field(default_factory=list)
     notification_sent: bool = False
     error: str | None = None
+    strategy_version_id: UUID | None = None
 
 
 class HealthCheckResult(BaseModel):
@@ -105,7 +327,9 @@ class FoldResult(BaseModel):
 class ResearchJobConfig(BaseModel):
     strategy_name: str
     symbol: str
+    exchange: str | None = None
     interval: str
+    auxiliary_intervals: list[Interval] = Field(default_factory=list)
     start: datetime
     end: datetime
     mode: Literal["backtest", "optimize", "walk-forward"] = "backtest"
@@ -116,10 +340,22 @@ class ResearchJobConfig(BaseModel):
     test_window: int | None = None
     optimize_target: str = "sharpe"
 
+    @field_validator("auxiliary_intervals", mode="before")
+    @classmethod
+    def normalize_auxiliary_intervals(cls, value: Any) -> list[Interval]:
+        if value is None:
+            return []
+        return [item if isinstance(item, Interval) else Interval(value=str(item)) for item in value]
+
     @field_validator("start", "end")
     @classmethod
     def normalize_dates(cls, value: datetime) -> datetime:
         return _ensure_utc(value)
+
+    @field_validator("exchange")
+    @classmethod
+    def normalize_exchange(cls, value: str | None) -> str | None:
+        return value.strip().upper() if value else None
 
     @model_validator(mode="after")
     def validate_ranges(self) -> "ResearchJobConfig":
@@ -182,6 +418,13 @@ class ResearchReport(BaseModel):
     def to_json(self) -> str:
         payload = self.model_dump(mode="json")
         return json.dumps(payload, indent=2, ensure_ascii=True)
+
+
+class AblationResult(BaseModel):
+    strategy_name: str
+    symbol: str
+    interval: str
+    variants: list[dict[str, Any]] = Field(default_factory=list)
 
 
 def aggregate_metrics(metric_rows: list[dict[str, float]]) -> dict[str, float]:

@@ -18,9 +18,14 @@ RUN uv sync --frozen --extra veighna --group dev --no-install-project \
     || uv sync --extra veighna --group dev --no-install-project
 
 COPY src ./src
+COPY alembic.ini docker-entrypoint.sh ./
+COPY migrations ./migrations
+
+RUN chmod +x /app/docker-entrypoint.sh
 
 RUN uv sync --frozen --extra veighna --group dev || uv sync --extra veighna --group dev
 
 RUN mkdir -p /app/reports /app/.vntrader
 
+ENTRYPOINT ["/app/docker-entrypoint.sh"]
 CMD ["vntdr", "live"]

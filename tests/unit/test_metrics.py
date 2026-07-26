@@ -13,6 +13,9 @@ def test_calculate_metrics_empty():
         "trade_count": 10.0,
         "win_rate": 0.0,
         "profit_factor": 0.0,
+        "cagr": 0.0,
+        "sortino_ratio": 0.0,
+        "calmar_ratio": 0.0,
     }
 
 def test_calculate_metrics_typical():
@@ -47,6 +50,9 @@ def test_calculate_metrics_typical():
     # sum_neg = 0.01 + 0.02 = 0.03
     # profit_factor = 0.08 / 0.03 = 2.6667
     assert res["profit_factor"] == 2.6667
+    assert res["cagr"] > 0
+    assert res["sortino_ratio"] > 0
+    assert res["calmar_ratio"] > 0
 
 def test_calculate_metrics_no_volatility():
     # All returns are identical, standard deviation is zero

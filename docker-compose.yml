@@ -59,6 +59,7 @@ services:
       REDIS_MAXMEMORY_POLICY: ${REDIS_MAXMEMORY_POLICY:-allkeys-lru}
       TG_BOT_TOKEN: ${TG_BOT_TOKEN:-}
       TG_CHAT_ID: ${TG_CHAT_ID:-}
+      VNTDR_RUN_MIGRATIONS: "true"
     depends_on:
       db:
         condition: service_healthy
@@ -99,6 +100,7 @@ services:
       REDIS_MAXMEMORY_POLICY: ${REDIS_MAXMEMORY_POLICY:-allkeys-lru}
       TG_BOT_TOKEN: ${TG_BOT_TOKEN:-}
       TG_CHAT_ID: ${TG_CHAT_ID:-}
+      VNTDR_RUN_MIGRATIONS: "false"
       GRADIO_PORT: ${GRADIO_CONTAINER_PORT:-7860}
     depends_on:
       db:

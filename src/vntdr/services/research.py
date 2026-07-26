@@ -11,8 +11,11 @@ from dataclasses import dataclass
 from typing import Any
 
 from vntdr.config import Settings
-from vntdr.models import BarRecord, FoldResult, ResearchJobConfig, ResearchReport, aggregate_metrics
+from vntdr.models import AblationResult, BarRecord, FoldResult, Instrument, Interval, ResearchJobConfig, ResearchReport, ResearchValidationResult, TradeRecord
+from vntdr.services.data_context import MarketDataContext
+from vntdr.services.position_sizing import AtrRiskSizer
 from vntdr.storage.repositories import MarketDataRepository, ResearchRunRepository
+from vntdr.storage.repositories import StrategyRepository
 
 EXACT_SEARCH_COMBINATION_LIMIT = 10_000
 
@@ -22,6 +25,7 @@ class BacktestOutcome:
     metrics: dict[str, float]
     equity_curve: list[float]
     signals: list[int]
+    trades: list[TradeRecord] | None = None
 
 
 @dataclass
@@ -31,6 +35,24 @@ class BacktestResult:
     parameters: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class CostModel:
+    """Per-side costs applied at executable prices and while a position is held."""
+
+    fee_rate: float
+    slippage_bps: float = 0.0
+    spread_bps: float = 0.0
+    funding_rate_per_bar: float = 0.0
+
+    @property
+    def execution_cost_rate(self) -> float:
+        return self.fee_rate + (self.slippage_bps + self.spread_bps / 2) / 10_000
+
+    def fill_price(self, raw_price: float, side: int) -> float:
+        """side=1 is buy (adverse upward), side=-1 is sell (adverse downward)."""
+        return raw_price * (1 + side * (self.slippage_bps + self.spread_bps / 2) / 10_000)
+
+
 class ResearchService:
     def __init__(
         self,
@@ -38,23 +60,96 @@ class ResearchService:
         settings: Settings,
         market_data_repository: MarketDataRepository,
         research_run_repository: ResearchRunRepository,
+        factor_repository: StrategyRepository | None = None,
     ) -> None:
         self.settings = settings
         self.market_data_repository = market_data_repository
         self.research_run_repository = research_run_repository
+        self.factor_repository = factor_repository
         self.settings.research.report_dir.mkdir(parents=True, exist_ok=True)
         self._executor = ThreadPoolExecutor(max_workers=4)
 
     def backtest(self, config: ResearchJobConfig) -> ResearchReport:
         bars = self._load_bars(config)
-        report = self._build_report(config, bars, parameters=config.parameters)
+        context = self._load_data_context(config, bars)
+        report = self._build_report(config, bars, parameters=config.parameters, data_context=context)
         self._persist_report(report, config)
         return report
 
     def backtest_with_details(self, config: ResearchJobConfig) -> BacktestResult:
         bars = self._load_bars(config)
-        outcome = self._execute_backtest(bars, config.strategy_name, config.parameters)
+        outcome = self._execute_backtest(
+            bars, config.strategy_name, config.parameters,
+            data_context=self._load_data_context(config, bars),
+        )
         return BacktestResult(outcome=outcome, bars=bars, parameters=config.parameters)
+
+    def factor_ablation(
+        self,
+        config: ResearchJobConfig,
+        variants: dict[str, dict[str, Any]],
+    ) -> AblationResult:
+        """Evaluate named parameter overrides against exactly the same bars.
+
+        Variants are deliberately supplied explicitly instead of optimized, so
+        an ablation cannot smuggle in different fitted parameters.
+        """
+        bars = self._load_bars(config)
+        context = self._load_data_context(config, bars)
+        rows = []
+        for name, overrides in variants.items():
+            parameters = {**config.parameters, **overrides}
+            outcome = self._execute_backtest(
+                bars, config.strategy_name, parameters, data_context=context
+            )
+            rows.append({"name": name, "parameters": parameters, "metrics": outcome.metrics})
+        return AblationResult(
+            strategy_name=config.strategy_name, symbol=config.symbol,
+            interval=config.interval, variants=rows,
+        )
+
+    def validate_candidate(
+        self,
+        *,
+        backtest_config: ResearchJobConfig,
+        walk_forward_config: ResearchJobConfig,
+        max_drawdown_limit: float = 0.10,
+        minimum_fold_count: int = 3,
+        minimum_trade_count: int = 10,
+    ) -> ResearchValidationResult:
+        """Run reproducible in-sample and out-of-sample acceptance gates.
+
+        The validation does not optimise the backtest configuration. The
+        walk-forward configuration alone selects each fold's parameters from
+        historical data, preserving the approval boundary.
+        """
+        if backtest_config.mode != "backtest":
+            raise ValueError("backtest_config.mode must be 'backtest'")
+        if walk_forward_config.mode != "walk-forward":
+            raise ValueError("walk_forward_config.mode must be 'walk-forward'")
+        identity = ("strategy_name", "symbol", "exchange", "interval")
+        if any(getattr(backtest_config, name) != getattr(walk_forward_config, name) for name in identity):
+            raise ValueError("backtest and walk-forward configurations must reference the same dataset")
+        backtest = self.backtest(backtest_config)
+        walk_forward = self.walk_forward(walk_forward_config)
+        reasons: list[str] = []
+        if backtest.metrics.get("trade_count", 0) < minimum_trade_count:
+            reasons.append(f"backtest_trade_count<{minimum_trade_count}")
+        if len(walk_forward.fold_results) < minimum_fold_count:
+            reasons.append(f"walk_forward_fold_count<{minimum_fold_count}")
+        maximum_drawdown = walk_forward.metrics.get("max_drawdown", 0.0)
+        if maximum_drawdown < -abs(max_drawdown_limit):
+            reasons.append(f"walk_forward_drawdown>{abs(max_drawdown_limit):.2%}")
+        if walk_forward.metrics.get("total_return", 0.0) <= 0:
+            reasons.append("walk_forward_total_return<=0")
+        return ResearchValidationResult(
+            backtest=backtest,
+            walk_forward=walk_forward,
+            passed=not reasons,
+            reasons=reasons,
+            max_drawdown_limit=max_drawdown_limit,
+            minimum_fold_count=minimum_fold_count,
+        )
 
     async def backtest_async(self, config: ResearchJobConfig) -> ResearchReport:
         return await asyncio.get_event_loop().run_in_executor(
@@ -65,12 +160,14 @@ class ResearchService:
 
     def optimize(self, config: ResearchJobConfig, method: str = "ga") -> ResearchReport:
         bars = self._load_bars(config)
+        context = self._load_data_context(config, bars)
         evaluations = self._evaluate_parameter_space(
             bars=bars,
             strategy_name=config.strategy_name,
             parameter_space=config.parameter_space,
             method=method,
             optimize_target=config.optimize_target,
+            data_context=context,
         )
         best_parameters, best_metrics = evaluations[0]
         report = ResearchReport(
@@ -103,8 +200,11 @@ class ResearchService:
 
     def walk_forward(self, config: ResearchJobConfig) -> ResearchReport:
         bars = self._load_bars(config)
+        context = self._load_data_context(config, bars)
         folds: list[FoldResult] = []
-        metric_rows: list[dict[str, float]] = []
+        out_of_sample_returns: list[float] = []
+        stitched_equity: list[float] = [1.0]
+        out_of_sample_trades: list[TradeRecord] = []
         offset = 0
         fold_index = 1
         run_stub = ResearchReport(
@@ -127,9 +227,21 @@ class ResearchService:
                 parameter_space=config.parameter_space,
                 method=config.method,
                 optimize_target=config.optimize_target,
+                data_context=context,
             )
             best_parameters, _ = evaluations[0]
-            outcome = self._execute_backtest(test_bars, config.strategy_name, best_parameters)
+            # Preserve the complete training history as indicator warm-up. The
+            # final closed training bar makes the first out-of-sample decision,
+            # which is filled at the first test-bar open. Only test-period
+            # transitions contribute to performance.
+            evaluation_bars = train_bars + test_bars
+            outcome = self._execute_backtest(
+                evaluation_bars,
+                config.strategy_name,
+                best_parameters,
+                decision_start_index=len(train_bars) - 1,
+                data_context=context,
+            )
             fold = FoldResult(
                 fold_index=fold_index,
                 train_start=train_bars[0].datetime,
@@ -140,12 +252,30 @@ class ResearchService:
                 parameters=best_parameters,
             )
             folds.append(fold)
-            metric_rows.append(outcome.metrics)
+            fold_returns = [
+                outcome.equity_curve[i] / outcome.equity_curve[i - 1] - 1
+                for i in range(1, len(outcome.equity_curve))
+                if outcome.equity_curve[i - 1] > 0
+            ]
+            for fold_return in fold_returns:
+                out_of_sample_returns.append(fold_return)
+                stitched_equity.append(stitched_equity[-1] * (1 + fold_return))
+            out_of_sample_trades.extend(outcome.trades or [])
             self.research_run_repository.add_fold_result(run_id, fold)
             offset += config.test_window
             fold_index += 1
 
-        aggregate = aggregate_metrics(metric_rows)
+        aggregate = self._metrics_from_returns(
+            out_of_sample_returns,
+            stitched_equity,
+            len(out_of_sample_trades),
+            bars[0].interval,
+        )
+        aggregate.update(self._trade_metrics(out_of_sample_trades))
+        aggregate["turnover"] = round(
+            sum(abs(trade.gross_return) for trade in out_of_sample_trades),
+            6,
+        )
         best_parameters = folds[-1].parameters if folds else {}
         report = ResearchReport(
             strategy_name=config.strategy_name,
@@ -177,8 +307,11 @@ class ResearchService:
         bars: list[BarRecord],
         *,
         parameters: dict[str, Any],
+        data_context: MarketDataContext | None = None,
     ) -> ResearchReport:
-        outcome = self._execute_backtest(bars, config.strategy_name, parameters)
+        outcome = self._execute_backtest(
+            bars, config.strategy_name, parameters, data_context=data_context
+        )
         return ResearchReport(
             strategy_name=config.strategy_name,
             symbol=config.symbol,
@@ -223,17 +356,43 @@ class ResearchService:
             interval=config.interval,
             start=config.start,
             end=config.end,
+            exchange=config.exchange,
         )
         if not bars:
             raise ValueError("No bars found for the requested research job.")
         return bars
 
+    def _load_data_context(
+        self, config: ResearchJobConfig, primary_bars: list[BarRecord]
+    ) -> MarketDataContext | None:
+        if not config.auxiliary_intervals and self.factor_repository is None:
+            return None
+        bars_by_interval = {Interval(value=config.interval).value: primary_bars}
+        for interval in config.auxiliary_intervals:
+            bars_by_interval[interval.value] = self.market_data_repository.fetch_bars(
+                symbol=config.symbol,
+                interval=interval.value,
+                start=config.start,
+                end=config.end,
+                exchange=config.exchange,
+            )
+        factors = []
+        if self.factor_repository is not None:
+            exchange = config.exchange or primary_bars[0].exchange
+            factors = self.factor_repository.factors_available_at(
+                Instrument(symbol=config.symbol, exchange=exchange), config.end
+            )
+        return MarketDataContext(bars_by_interval, factors=factors)
+
     def default_parameters(self, strategy_name: str) -> dict[str, Any]:
+        strategy = self._load_strategy(strategy_name)
+        defaults = dict(getattr(strategy, "DEFAULT_PARAMETERS", getattr(strategy, "defaults", {})))
         overrides = getattr(self.settings.research, "strategy_parameters", {})
         if overrides and strategy_name in overrides:
-            return dict(overrides[strategy_name])
-        strategy = self._load_strategy(strategy_name)
-        return dict(getattr(strategy, "DEFAULT_PARAMETERS", getattr(strategy, "defaults", {})))
+            # Persisted UI/Telegram overrides often predate newly introduced
+            # safe defaults. Merge rather than replacing the strategy schema.
+            return {**defaults, **dict(overrides[strategy_name])}
+        return defaults
 
     def default_parameter_space(self, strategy_name: str) -> dict[str, list[Any]]:
         strategy = self._load_strategy(strategy_name)
@@ -285,11 +444,24 @@ class ResearchService:
         strategy_name: str,
         bars: list[BarRecord],
         parameters: dict[str, Any],
+        current_position: int = 0,
+        data_context: MarketDataContext | None = None,
     ) -> int:
         strategy = self._load_strategy(strategy_name)
         if not bars:
             return 0
-        sig = int(strategy.signal_for_index(bars, len(bars) - 1, parameters))
+        if hasattr(strategy, "target_position_for_context") and data_context is not None:
+            sig = int(strategy.target_position_for_context(
+                bars, len(bars) - 1, parameters, current_position, data_context
+            ))
+        elif hasattr(strategy, "target_position_for_index"):
+            sig = int(
+                strategy.target_position_for_index(
+                    bars, len(bars) - 1, parameters, current_position
+                )
+            )
+        else:
+            sig = int(strategy.signal_for_index(bars, len(bars) - 1, parameters))
         trade_mode = getattr(self.settings.research, "trade_mode", "both")
         if trade_mode == "long_only" and sig < 0:
             return 0
@@ -303,13 +475,21 @@ class ResearchService:
         strategy_name: str,
         bars: list[BarRecord],
         parameters: dict[str, Any],
+        current_position: int = 0,
+        data_context: MarketDataContext | None = None,
     ) -> int:
+        from functools import partial
+
         return await asyncio.get_event_loop().run_in_executor(
             self._executor,
-            self.latest_signal,
-            strategy_name,
-            bars,
-            parameters
+            partial(
+                self.latest_signal,
+                strategy_name=strategy_name,
+                bars=bars,
+                parameters=parameters,
+                current_position=current_position,
+                data_context=data_context,
+            ),
         )
 
     def _evaluate_parameter_space(
@@ -320,6 +500,7 @@ class ResearchService:
         parameter_space: dict[str, list[Any]],
         method: str = "ga",
         optimize_target: str = "sharpe",
+        data_context: MarketDataContext | None = None,
     ) -> list[tuple[dict[str, Any], dict[str, float]]]:
         m = str(method).lower().strip()
         
@@ -338,11 +519,11 @@ class ResearchService:
             m = "grid"
 
         if m == "grid":
-            return self._run_grid_search(bars, strategy_name, parameter_space, optimize_target)
+            return self._run_grid_search(bars, strategy_name, parameter_space, optimize_target, data_context)
         elif m in ("heuristic", "bfs", "astar"):
-            return self._run_heuristic_search(bars, strategy_name, parameter_space, optimize_target)
+            return self._run_heuristic_search(bars, strategy_name, parameter_space, optimize_target, data_context=data_context)
         else:
-            return self._run_genetic_search(bars, strategy_name, parameter_space, optimize_target)
+            return self._run_genetic_search(bars, strategy_name, parameter_space, optimize_target, data_context=data_context)
 
     def _run_grid_search(
         self,
@@ -350,6 +531,7 @@ class ResearchService:
         strategy_name: str,
         parameter_space: dict[str, list[Any]],
         optimize_target: str = "sharpe",
+        data_context: MarketDataContext | None = None,
     ) -> list[tuple[dict[str, Any], dict[str, float]]]:
         keys = list(parameter_space.keys())
         value_lists = [parameter_space[k] for k in keys]
@@ -358,7 +540,7 @@ class ResearchService:
         evaluations = []
         for combo in combinations:
             params = dict(zip(keys, combo, strict=True))
-            outcome = self._execute_backtest(bars, strategy_name, params)
+            outcome = self._execute_with_context(bars, strategy_name, params, data_context)
             evaluations.append((params, outcome.metrics))
             
         return self._sort_evaluations(evaluations, optimize_target)
@@ -370,6 +552,7 @@ class ResearchService:
         parameter_space: dict[str, list[Any]],
         optimize_target: str = "sharpe",
         max_evaluations: int = 100,
+        data_context: MarketDataContext | None = None,
     ) -> list[tuple[dict[str, Any], dict[str, float]]]:
         """A*-inspired Heuristic graph search over parameter grid."""
         import heapq
@@ -388,7 +571,7 @@ class ResearchService:
                 _, metrics = evaluations[node]
             else:
                 params = node_to_params(node)
-                outcome = self._execute_backtest(bars, strategy_name, params)
+                outcome = self._execute_with_context(bars, strategy_name, params, data_context)
                 metrics = outcome.metrics
                 evaluations[node] = (params, metrics)
                 
@@ -451,6 +634,7 @@ class ResearchService:
         strategy_name: str,
         parameter_space: dict[str, list[Any]],
         optimize_target: str = "sharpe",
+        data_context: MarketDataContext | None = None,
     ) -> list[tuple[dict[str, Any], dict[str, float]]]:
         # Use a local Random instance with a fixed seed for 100% reproducibility
         local_random = random.Random(42)
@@ -468,7 +652,7 @@ class ResearchService:
             for parameters in population:
                 signature = json.dumps(parameters, sort_keys=True)
                 if signature not in evaluations:
-                    outcome = self._execute_backtest(bars, strategy_name, parameters)
+                    outcome = self._execute_with_context(bars, strategy_name, parameters, data_context)
                     evaluations[signature] = (parameters.copy(), outcome.metrics)
                 scored.append(evaluations[signature])
             # Sort by target primarily, penalizing zero trades to avoid passive dominance
@@ -519,16 +703,47 @@ class ResearchService:
         bars: list[BarRecord],
         strategy_name: str,
         parameters: dict[str, Any],
+        *,
+        decision_start_index: int = 0,
+        data_context: MarketDataContext | None = None,
     ) -> BacktestOutcome:
         if not bars:
             return BacktestOutcome(metrics={}, equity_curve=[], signals=[])
+        if decision_start_index < 0 or decision_start_index >= len(bars):
+            raise ValueError("decision_start_index must point to a bar in the input")
 
         strategy = self._load_strategy(strategy_name)
+        # Walk-forward evaluators supply only the parameters being searched.
+        # Merge the complete strategy defaults here so fixed safety controls
+        # (ATR sizing, execution governance, factor scales) apply identically
+        # to backtests, optimization folds and runtime research.
+        strategy_defaults = dict(getattr(strategy, "DEFAULT_PARAMETERS", {}))
+        try:
+            strategy_defaults = self.default_parameters(strategy_name)
+        except (ImportError, ModuleNotFoundError):
+            # Tests and third-party in-memory strategy doubles have no module.
+            pass
+        parameters = {**strategy_defaults, **parameters}
         position = 0
-        trade_count = 0
+        position_exposure = 1.0
         equity = [1.0]
         step_returns: list[float] = []
         signals: list[int] = []
+        trades: list[TradeRecord] = []
+        entry_price: float | None = None
+        entry_time = None
+        entry_index: int | None = None
+        last_mark_price: float | None = None
+        cooldown_until_index = 0
+        min_holding_bars = max(0, int(parameters.get("min_holding_bars", 0)))
+        cooldown_bars = max(0, int(parameters.get("cooldown_bars", 0)))
+        atr_sizing_enabled = bool(parameters.get("enable_atr_sizing", False))
+        atr_window = max(1, int(parameters.get("sizing_atr_window", 14)))
+        sizer = AtrRiskSizer(
+            risk_fraction=float(parameters.get("risk_fraction", 0.01)),
+            stop_atr_multiple=float(parameters.get("stop_atr_multiple", 2.0)),
+            max_notional_fraction=float(parameters.get("max_notional_fraction", 0.30)),
+        ) if atr_sizing_enabled else None
         
         # Get fee rate from settings
         fee_rate = (
@@ -536,13 +751,48 @@ class ResearchService:
             if self.settings.research.use_maker_fee
             else self.settings.research.taker_fee_rate
         )
+        costs = CostModel(
+            fee_rate=fee_rate,
+            slippage_bps=getattr(self.settings.research, "slippage_bps", 0.0),
+            spread_bps=getattr(self.settings.research, "spread_bps", 0.0),
+            funding_rate_per_bar=getattr(self.settings.research, "funding_rate_per_bar", 0.0),
+        )
         
-        # Backtest loop: 
-        # 1. Calculate signal at end of bar 'index' (using data up to 'index')
-        # 2. Execute trade at close price of bar 'index' (paying fees)
-        # 3. Earn/lose return from bar 'index' to bar 'index + 1'
-        for index in range(len(bars) - 1):
-            signal = int(strategy.signal_for_index(bars, index, parameters))
+        # Signal is calculated from a closed bar, then filled at the *next*
+        # bar's open.  This prevents the optimistic same-close fill that the
+        # original research loop used.
+        for index in range(decision_start_index, len(bars) - 1):
+            period_start_equity = equity[-1]
+            period_end_equity = period_start_equity
+            if hasattr(strategy, "target_position_for_context") and data_context is not None:
+                signal = int(
+                    strategy.target_position_for_context(
+                        bars, index, parameters, position, data_context
+                    )
+                )
+            elif hasattr(strategy, "target_position_for_index"):
+                signal = int(
+                    strategy.target_position_for_index(
+                        bars, index, parameters, position
+                    )
+                )
+            else:
+                signal = int(strategy.signal_for_index(bars, index, parameters))
+
+            # Generic execution governance is parameterised on the strategy
+            # version so every plugin can opt in without duplicating stateful
+            # fill logic. A reversal first closes the position, then observes
+            # the cooldown before any new exposure is opened.
+            if position == 0 and index + 1 < cooldown_until_index:
+                signal = 0
+            elif position != 0 and signal != position:
+                assert entry_index is not None
+                held_bars = index + 1 - entry_index
+                if held_bars < min_holding_bars:
+                    signal = position
+                elif cooldown_bars:
+                    signal = 0
+                    cooldown_until_index = index + 1 + cooldown_bars
             
             # Apply trade mode filtering
             trade_mode = getattr(self.settings.research, "trade_mode", "both")
@@ -552,46 +802,126 @@ class ResearchService:
                 signal = 0
                 
             signals.append(signal)
-            
+
+            fill_bar = bars[index + 1]
+            raw_fill_price = fill_bar.open
+            if last_mark_price is not None and position:
+                period_end_equity *= 1 + position * position_exposure * (raw_fill_price / last_mark_price - 1)
+                period_end_equity *= 1 - costs.funding_rate_per_bar * position_exposure
+
             if signal != position:
-                before_fee_equity = equity[-1]
                 if position != 0:
-                    equity[-1] *= (1 - fee_rate)
-                    trade_count += 1
+                    fill_price = costs.fill_price(raw_fill_price, side=-position)
+                    period_end_equity *= 1 - costs.execution_cost_rate * position_exposure
+                    assert entry_price is not None and entry_time is not None and entry_index is not None
+                    gross_return = position_exposure * position * (fill_price / entry_price - 1)
+                    transaction_cost = 2 * costs.execution_cost_rate * position_exposure
+                    funding_cost = costs.funding_rate_per_bar * position_exposure * (index + 1 - entry_index)
+                    net_return = (1 + gross_return) * (1 - 2 * costs.fee_rate * position_exposure) - 1 - funding_cost
+                    trades.append(TradeRecord(
+                        direction="long" if position > 0 else "short", entry_time=entry_time,
+                        exit_time=fill_bar.datetime, entry_price=entry_price, exit_price=fill_price,
+                        gross_return=gross_return, net_return=net_return, bars_held=index + 1 - entry_index,
+                        transaction_cost=transaction_cost, funding_cost=funding_cost,
+                    ))
                 
                 if signal != 0:
-                    equity[-1] *= (1 - fee_rate)
-                    trade_count += 1
+                    next_exposure = 1.0
+                    if sizer is not None:
+                        atr_start = max(0, index - atr_window + 1)
+                        true_ranges = [
+                            bars[item].high - bars[item].low
+                            if item == 0
+                            else max(
+                                bars[item].high - bars[item].low,
+                                abs(bars[item].high - bars[item - 1].close),
+                                abs(bars[item].low - bars[item - 1].close),
+                            )
+                            for item in range(atr_start, index + 1)
+                        ]
+                        atr = sum(true_ranges) / len(true_ranges) if true_ranges else 0.0
+                        decision = sizer.size(equity=period_end_equity, price=raw_fill_price, atr=atr)
+                        next_exposure = decision.notional / period_end_equity if period_end_equity else 0.0
+                    if next_exposure <= 0:
+                        signal = 0
+                    else:
+                        position_exposure = next_exposure
+                if signal != 0:
+                    fill_price = costs.fill_price(raw_fill_price, side=signal)
+                    period_end_equity *= 1 - costs.execution_cost_rate * position_exposure
+                    entry_price, entry_time, entry_index = fill_price, fill_bar.datetime, index + 1
 
-                if before_fee_equity > 0:
-                    step_returns.append((equity[-1] / before_fee_equity) - 1)
-                else:
-                    step_returns.append(0.0)
                 position = signal
-
-            # PnL is realized from bar 'index' to 'index + 1'
-            price_return = (bars[index + 1].close / bars[index].close) - 1
-            pnl = price_return * position
-            next_equity = equity[-1] * (1 + pnl)
-            if equity[-1] > 0:
-                step_returns.append((next_equity / equity[-1]) - 1)
-            else:
-                step_returns.append(0.0)
-            equity.append(next_equity)
+                if position == 0:
+                    position_exposure = 1.0
+            last_mark_price = raw_fill_price
+            # One primary-bar transition produces exactly one net return. Price
+            # movement, funding, spread, slippage and fees are combined here;
+            # flat periods remain explicit zero observations for valid
+            # volatility/annualisation statistics.
+            step_returns.append(
+                period_end_equity / period_start_equity - 1
+                if period_start_equity > 0
+                else 0.0
+            )
+            equity.append(period_end_equity)
             
         # Close final position if any to account for exit fees
         if position != 0:
-            before_fee_equity = equity[-1]
-            equity[-1] *= (1 - fee_rate)
-            trade_count += 1
-            if before_fee_equity > 0:
-                step_returns.append((equity[-1] / before_fee_equity) - 1)
-            else:
-                step_returns.append(0.0)
+            final_bar = bars[-1]
+            equity[-1] *= 1 + position * position_exposure * (final_bar.close / (last_mark_price or final_bar.open) - 1)
+            exit_price = costs.fill_price(final_bar.close, side=-position)
+            equity[-1] *= 1 - costs.execution_cost_rate * position_exposure
+            # The final open-to-close mark and liquidation belong to the last
+            # primary-bar transition rather than to artificial extra periods.
+            if len(equity) >= 2 and step_returns:
+                prior_equity = equity[-2]
+                step_returns[-1] = equity[-1] / prior_equity - 1 if prior_equity > 0 else 0.0
+            assert entry_price is not None and entry_time is not None and entry_index is not None
+            gross_return = position_exposure * position * (exit_price / entry_price - 1)
+            transaction_cost = 2 * costs.execution_cost_rate * position_exposure
+            funding_cost = costs.funding_rate_per_bar * position_exposure * (len(bars) - 1 - entry_index)
+            net_return = (1 + gross_return) * (1 - 2 * costs.fee_rate * position_exposure) - 1 - funding_cost
+            trades.append(TradeRecord(
+                direction="long" if position > 0 else "short", entry_time=entry_time,
+                exit_time=final_bar.datetime, entry_price=entry_price, exit_price=exit_price,
+                gross_return=gross_return, net_return=net_return, bars_held=len(bars) - 1 - entry_index,
+                transaction_cost=transaction_cost, funding_cost=funding_cost,
+            ))
 
         interval = bars[0].interval
-        metrics = self._metrics_from_returns(step_returns, equity, trade_count, interval)
-        return BacktestOutcome(metrics=metrics, equity_curve=equity, signals=signals)
+        metrics = self._metrics_from_returns(step_returns, equity, len(trades), interval)
+        metrics.update(self._trade_metrics(trades))
+        metrics["turnover"] = round(sum(abs(trade.gross_return) for trade in trades), 6)
+        return BacktestOutcome(metrics=metrics, equity_curve=equity, signals=signals, trades=trades)
+
+    def _execute_with_context(
+        self,
+        bars: list[BarRecord],
+        strategy_name: str,
+        parameters: dict[str, Any],
+        data_context: MarketDataContext | None,
+    ) -> BacktestOutcome:
+        """Keep direct test/plugin replacements backward compatible."""
+        if data_context is None:
+            return self._execute_backtest(bars, strategy_name, parameters)
+        return self._execute_backtest(
+            bars, strategy_name, parameters, data_context=data_context
+        )
+
+    @staticmethod
+    def _trade_metrics(trades: list[TradeRecord]) -> dict[str, float]:
+        if not trades:
+            return {"trade_count": 0.0, "win_rate": 0.0, "profit_factor": 0.0}
+        returns = [trade.net_return for trade in trades]
+        wins = [value for value in returns if value > 0]
+        losses = [value for value in returns if value < 0]
+        profit_factor = sum(wins) / abs(sum(losses)) if losses else (99.9 if wins else 0.0)
+        return {
+            "trade_count": float(len(trades)),
+            "win_rate": round(len(wins) / len(trades), 4),
+            "profit_factor": round(profit_factor, 4),
+        }
 
     def _load_strategy(self, strategy_name: str) -> Any:
         module = importlib.import_module(f"vntdr.strategies.{strategy_name}")

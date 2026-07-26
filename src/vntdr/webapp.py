@@ -14,10 +14,12 @@ from plotly.subplots import make_subplots
 from vntdr.config import Settings
 from vntdr.models import ResearchJobConfig
 from vntdr.services.config_service import ConfigService
+from vntdr.services.data_quality import assess_bars
 from vntdr.services.history import OkxHistoryClient, HistorySyncService
 from vntdr.services.research import ResearchService
+from vntdr.services.tradingview_history import TradingViewHistoryClient
 from vntdr.storage.database import Database
-from vntdr.storage.repositories import MarketDataRepository, ResearchRunRepository
+from vntdr.storage.repositories import MarketDataRepository, ResearchRunRepository, StrategyRepository
 
 
 # ── 工具函数 ──────────────────────────────────────────────────────────
@@ -151,6 +153,7 @@ METRIC_ZH = {
     "Trade Count":      "交易次数",
     "Win Rate":         "胜率",
     "Profit Factor":    "盈亏比",
+    "Closed Trade Count": "完整交易次数",
 }
 
 
@@ -197,6 +200,39 @@ STRATEGY_PARAMS: dict[str, dict[str, Any]] = {
             "slow_length":   "10~80",
             "signal_length": "2~25",
             "trend_window":  "2~40",
+        },
+    },
+    "multi_factor": {
+        "defaults": {
+            "trend_window": 50, "breakout_window": 20, "regime_window": 20,
+            "min_efficiency": 0.15, "atr_window": 14, "max_atr_ratio": 0.04,
+            "entry_threshold": 0.6, "exit_threshold": 0.2,
+            "trend_weight": 0.5, "momentum_weight": 0.5,
+            "daily_trend_weight": 0.0, "funding_weight": 0.0,
+            "open_interest_weight": 0.0, "funding_rate_scale": 0.001,
+            "open_interest_change_scale": 0.05, "min_holding_bars": 3,
+            "cooldown_bars": 2, "enable_volatility": True, "enable_atr_sizing": True,
+            "risk_fraction": 0.01, "stop_atr_multiple": 2.0, "max_notional_fraction": 0.30,
+        },
+        "space": {
+            "trend_window": "30,50,80", "breakout_window": "15,20,30",
+            "regime_window": "10,20,30", "min_efficiency": "0.1,0.2,0.3",
+            "max_atr_ratio": "0.02,0.04,0.06", "entry_threshold": "0.5,0.6,0.7",
+            "exit_threshold": "0.1,0.2,0.3", "trend_weight": "0,0.5,1",
+            "momentum_weight": "0,0.5,1", "daily_trend_weight": "0,0.25,0.5",
+        },
+        "bounds": {
+            "trend_window": "20~100:10", "breakout_window": "10~40:5",
+            "regime_window": "10~40:5", "min_efficiency": "0.05~0.4:0.05",
+            "max_atr_ratio": "0.01~0.08:0.01", "entry_threshold": "0.4~0.8:0.1",
+            "exit_threshold": "0.05~0.4:0.05", "trend_weight": "0~1:0.25",
+            "momentum_weight": "0~1:0.25", "daily_trend_weight": "0~0.5:0.25",
+            "funding_weight": "0~0.5:0.25", "open_interest_weight": "0~0.5:0.25",
+            "funding_rate_scale": "0.0005~0.003:0.0005",
+            "open_interest_change_scale": "0.02~0.15:0.01",
+            "min_holding_bars": "1~10", "cooldown_bars": "0~10",
+            "risk_fraction": "0.0025~0.02:0.0025", "stop_atr_multiple": "1~4:0.5",
+            "max_notional_fraction": "0.1~0.5:0.1",
         },
     },
 }
@@ -272,6 +308,7 @@ def _init_services():
     research = ResearchService(
         settings=settings, market_data_repository=mdr,
         research_run_repository=rrr,
+        factor_repository=StrategyRepository(database),
     )
     history = HistorySyncService(
         settings=settings,
@@ -325,6 +362,72 @@ def _get_targets_df_and_choices():
     choices = [f"{t['symbol']} ({t['interval']} - {t['strategy_name']})" for t in targets]
     val = choices[-1] if choices else None
     return df, choices, val
+
+
+def _platform_instances_df() -> pd.DataFrame:
+    """Read-only strategy platform overview for the Gradio governance tab."""
+    settings = _get_config_service().settings
+    repository = StrategyRepository(Database(settings.database.dsn))
+    now = datetime.now(timezone.utc)
+    rows = []
+    for instance in repository.list_instances():
+        version = repository.active_version(str(instance.id), now)
+        rows.append([
+            instance.name,
+            instance.instrument.symbol,
+            instance.instrument.asset_class,
+            instance.primary_interval.value,
+            instance.execution_mode,
+            "启用" if instance.enabled else "停用",
+            version.strategy_name if version else "待审批",
+            str(version.id) if version else "-",
+        ])
+    return pd.DataFrame(rows, columns=["实例", "标的", "品类", "主周期", "执行模式", "状态", "生效策略", "版本 ID"])
+
+
+def _shadow_runs_df() -> pd.DataFrame:
+    """Read-only audit view of notification-only shadow performance."""
+    settings = _get_config_service().settings
+    repository = StrategyRepository(Database(settings.database.dsn))
+    rows = []
+    for run in repository.list_shadow_runs():
+        elapsed_end = run.last_observed_at or datetime.now(timezone.utc)
+        elapsed_days = max(0, (elapsed_end - run.started_at).total_seconds() / 86400)
+        rows.append([
+            str(run.id), str(run.instance_id), str(run.strategy_version_id), run.status,
+            round(elapsed_days, 1), run.observation_count, round(run.current_equity, 6),
+            f"{run.max_drawdown:.2%}",
+            run.last_observed_at.isoformat() if run.last_observed_at else "尚无观测",
+        ])
+    return pd.DataFrame(rows, columns=[
+        "影子运行 ID", "实例 ID", "版本 ID", "状态", "观察天数", "观测数",
+        "当前权益", "最大回撤", "最后观测",
+    ])
+
+
+def _data_health_df() -> pd.DataFrame:
+    """Show the exact data-quality gate that protects each enabled instance."""
+    settings = _get_config_service().settings
+    database = Database(settings.database.dsn)
+    strategies = StrategyRepository(database)
+    market_data = MarketDataRepository(database)
+    now = datetime.now(timezone.utc)
+    rows = []
+    for instance in strategies.list_instances(enabled_only=True):
+        bars = market_data.fetch_latest_bars(
+            instance.instrument.symbol, instance.primary_interval.value, limit=200,
+            exchange=instance.instrument.exchange,
+        )
+        report = assess_bars(
+            bars, instance.primary_interval.value, now, minimum_bars=50,
+            calendar=instance.instrument.calendar,
+        )
+        rows.append([
+            instance.name, instance.instrument.symbol, instance.primary_interval.value,
+            report.bar_count, report.gaps_detected, "是" if report.stale else "否",
+            "可用" if report.usable else "阻止开仓", report.reason or "-",
+        ])
+    return pd.DataFrame(rows, columns=["实例", "标的", "周期", "K线数", "缺口", "过期", "数据门", "原因"])
 
 
 # ── K线 + MACD 指标图 ────────────────────────────────────────────────
@@ -569,7 +672,7 @@ def main(port: int | None = None) -> None:
                         )
                         global_symbol = gr.Dropdown(
                             label="交易对 (Symbol)",
-                            choices=["XAU-USDT-SWAP", "QQQ-USDT-SWAP", "BTC-USDT-SWAP", "ETH-USDT-SWAP"],
+                            choices=["XAU-USDT-SWAP", "QQQ-USDT-SWAP", "BTC-USDT-SWAP", "ETH-USDT-SWAP", "TV:XAUUSD", "TV:QQQ", "TV:BTCUSDT.P"],
                             value=initial_symbol,
                             allow_custom_value=True,
                         )
@@ -582,7 +685,17 @@ def main(port: int | None = None) -> None:
                             global_start = gr.DateTime(label="开始时间", value=default_start, type="datetime", include_time=False, interactive=True)
                             global_end = gr.DateTime(label="结束时间", value=default_end, type="datetime", include_time=False, interactive=True)
                         with gr.Row():
-                            global_sync_btn = gr.Button("🔄 同步 OKX 行情数据", variant="secondary")
+                            global_data_source = gr.Dropdown(
+                                label="行情来源",
+                                choices=[("OKX 可成交行情", "okx"), ("TradingView 研究代理", "tradingview")],
+                                value="okx",
+                            )
+                            global_sync_btn = gr.Button("🔄 同步行情数据", variant="secondary")
+                        global_tv_symbol = gr.Textbox(
+                            label="TradingView 标识（仅研究代理）",
+                            value="OANDA:XAUUSD",
+                            info="例如 OANDA:XAUUSD、NASDAQ:QQQ、OKX:BTCUSDT.P；输出标的必须以 TV: 开头",
+                        )
                         global_sync_status = gr.Textbox(label="数据同步状态", interactive=False)
 
                         with gr.Accordion("⚙️ 策略参数与微调 (Backtest)", open=True):
@@ -593,7 +706,7 @@ def main(port: int | None = None) -> None:
                                 lines=3,
                             )
                             bt_params_macd = gr.Textbox(
-                                label="cm_macd_ult_mtf 参数",
+                                label="策略参数",
                                 value="fast_length=6\nslow_length=21\nsignal_length=3\ntrend_window=7",
                                 visible=True,
                                 lines=4,
@@ -760,6 +873,26 @@ def main(port: int | None = None) -> None:
                         btn_remove_target = gr.Button("🗑️ 移除选中的监控目标", variant="stop", scale=1)
                     manage_status = gr.Textbox(label="操作状态", interactive=False)
 
+            with gr.Tab("🧩 策略平台", id="tab_platform"):
+                gr.Markdown("### 版本化策略实例\n新版本需通过回测、走查和影子验证后，使用 `vntdr strategy-approve` 激活。当前发布仅通知，不会下单。")
+                platform_instances = gr.Dataframe(
+                    headers=["实例", "标的", "品类", "主周期", "执行模式", "状态", "生效策略", "版本 ID"],
+                    label="策略实例与当前生效版本", interactive=False,
+                )
+                platform_refresh_btn = gr.Button("🔄 刷新策略平台", variant="primary")
+                gr.Markdown("### 影子绩效\n仅通知模式的版本化权益观察；通过审批至少需要 28 天、有效观测且回撤不超过 10%。")
+                shadow_runs = gr.Dataframe(
+                    headers=["影子运行 ID", "实例 ID", "版本 ID", "状态", "观察天数", "观测数", "当前权益", "最大回撤", "最后观测"],
+                    label="影子运行审计", interactive=False,
+                )
+                shadow_refresh_btn = gr.Button("🔄 刷新影子绩效")
+                gr.Markdown("### 数据健康\n数据过期、有效交易时段缺口或不足 50 根 K 线时，系统会阻止新开仓。")
+                data_health = gr.Dataframe(
+                    headers=["实例", "标的", "周期", "K线数", "缺口", "过期", "数据门", "原因"],
+                    label="策略数据健康", interactive=False,
+                )
+                data_health_refresh_btn = gr.Button("🔄 刷新数据健康")
+
             # ── Tab 3: 设置 ────────────────────────────────────
             with gr.Tab("系统设置", id="tab_settings"):
                 cfg_status = gr.Textbox(label="状态", interactive=False)
@@ -815,7 +948,7 @@ def main(port: int | None = None) -> None:
 
         # ── 事件处理 ──────────────────────────────────────────────
 
-        def run_fetch_from_okx(symbol, interval, start, end):
+        def run_fetch_market_data(symbol, interval, start, end, source, tradingview_symbol):
             try:
                 _, history, mdr = _get_services()
                 if not start or not end:
@@ -824,12 +957,32 @@ def main(port: int | None = None) -> None:
                 end_dt   = _parse_datetime(end, is_end=True)
                 if start_dt >= end_dt:
                     return "开始日期必须早于结束日期"
-                history.sync(
-                    symbol=symbol, interval=interval,
-                    start=start_dt, end=end_dt, fill_missing=False,
-                )
-                count = len(mdr.fetch_bars(symbol, interval, start_dt, end_dt))
-                return f"已同步 {count} 根K线 — {symbol} ({interval})"
+                if source == "tradingview":
+                    if not symbol.startswith("TV:"):
+                        return "TradingView 研究数据的输出标的必须以 TV: 开头，例如 TV:XAUUSD"
+                    service = HistorySyncService(
+                        settings=history.settings,
+                        history_client=TradingViewHistoryClient(
+                            tradingview_symbol=tradingview_symbol,
+                            output_symbol=symbol,
+                            auth_token=os.getenv("TRADINGVIEW_AUTH_TOKEN"),
+                        ),
+                        market_data_repository=mdr,
+                        research_run_repository=history.research_run_repository,
+                    )
+                    service.sync(
+                        symbol=symbol, interval=interval, start=start_dt, end=end_dt,
+                        fill_missing=False, calendar="weekday",
+                    )
+                    exchange = "TRADINGVIEW"
+                else:
+                    history.sync(
+                        symbol=symbol, interval=interval,
+                        start=start_dt, end=end_dt, fill_missing=False,
+                    )
+                    exchange = "OKX"
+                count = len(mdr.fetch_bars(symbol, interval, start_dt, end_dt, exchange=exchange))
+                return f"已同步 {count} 根K线 — {symbol} ({interval})，来源：{exchange}"
             except Exception as e:
                 return f"错误：{e}"
 
@@ -1220,8 +1373,8 @@ def main(port: int | None = None) -> None:
         # ── 绑定事件 ──────────────────────────────────────────────
 
         global_sync_btn.click(
-            run_fetch_from_okx,
-            inputs=[global_symbol, global_interval, global_start, global_end],
+            run_fetch_market_data,
+            inputs=[global_symbol, global_interval, global_start, global_end, global_data_source, global_tv_symbol],
             outputs=[global_sync_status],
         )
 
@@ -1598,12 +1751,14 @@ def main(port: int | None = None) -> None:
 
         def update_strategy_change(strategy_name):
             space_text = _default_space_text(strategy_name)
+            defaults = STRATEGY_PARAMS.get(strategy_name, {}).get("defaults", {})
+            params_text = "\n".join(f"{key}={value}" for key, value in defaults.items())
             show_lookback = strategy_name == "demo_momentum"
-            show_macd     = strategy_name == "cm_macd_ult_mtf"
+            show_macd     = not show_lookback
             return (
                 space_text,
-                gr.update(visible=show_lookback),
-                gr.update(visible=show_macd),
+                gr.update(visible=show_lookback, value=params_text if show_lookback else None),
+                gr.update(visible=show_macd, value=params_text if show_macd else None, label=f"{strategy_name} 参数"),
             )
 
         global_strategy.change(
@@ -1809,6 +1964,9 @@ def main(port: int | None = None) -> None:
             fetch_live_status,
             outputs=[live_health, live_config, live_account, live_positions, live_logs_table]
         )
+        platform_refresh_btn.click(_platform_instances_df, outputs=[platform_instances])
+        shadow_refresh_btn.click(_shadow_runs_df, outputs=[shadow_runs])
+        data_health_refresh_btn.click(_data_health_df, outputs=[data_health])
 
         def add_monitored_target(symbol, interval, strategy, volume):
             try:

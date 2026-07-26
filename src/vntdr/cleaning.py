@@ -23,6 +23,7 @@ def clean_bars(
     raw_bars: list[dict[str, Any]],
     interval: str,
     fill_missing: bool = False,
+    calendar: str = "continuous",
 ) -> CleanBarsResult:
     normalized: dict[tuple[str, str, str, object], BarRecord] = {}
     duplicates_removed = 0
@@ -50,9 +51,12 @@ def clean_bars(
     for current in bars[1:]:
         previous = final_bars[-1]
         gap_cursor = previous.datetime + delta
-        if current.datetime > gap_cursor:
+        unexpected_gap = current.datetime > gap_cursor and _is_open_gap(
+            previous.datetime, current.datetime, delta, calendar
+        )
+        if unexpected_gap:
             gaps_detected += 1
-        while fill_missing and current.datetime > gap_cursor:
+        while fill_missing and unexpected_gap and current.datetime > gap_cursor:
             synthetic = BarRecord(
                 symbol=previous.symbol,
                 exchange=previous.exchange,
@@ -77,3 +81,18 @@ def clean_bars(
         gaps_detected=gaps_detected,
         gaps_filled=gaps_filled,
     )
+
+
+def _is_open_gap(previous, current, delta, calendar: str) -> bool:
+    if calendar == "continuous":
+        return True
+    if calendar != "weekday":
+        raise ValueError("calendar must be 'continuous' or 'weekday'")
+    if delta < timedelta(days=1):
+        return previous.date() == current.date()
+    cursor = previous + delta
+    while cursor < current:
+        if cursor.weekday() < 5:
+            return True
+        cursor += delta
+    return False

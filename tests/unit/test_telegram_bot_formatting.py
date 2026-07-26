@@ -1,5 +1,6 @@
 from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock
+from uuid import uuid4
 
 import pytest
 
@@ -58,6 +59,7 @@ def test_format_monitor_result_includes_actions_and_parameters() -> None:
             best_parameters={"fast_length": 3},
             actions=["buy_short", "buy_long"],
             notification_sent=True,
+            strategy_version_id=uuid4(),
         )
     )
 
@@ -65,6 +67,7 @@ def test_format_monitor_result_includes_actions_and_parameters() -> None:
     assert "15m" in message
     assert "buy_short" in message
     assert "fast_length" in message
+    assert "版本:" in message
 
 
 def test_format_watch_status_includes_poll_seconds() -> None:

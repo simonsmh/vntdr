@@ -8,8 +8,11 @@ from typing import Any, Protocol
 
 from vntdr.cleaning import INTERVAL_TO_DELTA
 from vntdr.models import MonitorResult, OrderInstruction
+from vntdr.services.data_quality import assess_bars
+from vntdr.services.data_context import MarketDataContext
 from vntdr.services.research import ResearchService
 from vntdr.services.risk import RiskManager
+from vntdr.services.strategy_runtime import StrategyRuntimeService
 from vntdr.storage.repositories import MarketDataRepository
 
 logger = logging.getLogger(__name__)
@@ -110,12 +113,18 @@ class MonitoringService:
         symbol: str,
         interval: str,
         parameter_space: dict[str, list[Any]] | None = None,
+        parameters: dict[str, Any] | None = None,
+        execution_mode: str | None = None,
         volume: float,
         method: str = "ga",
         lookback_bars: int = 120,
+        auxiliary_bars_by_interval: dict[str, list[Any]] | None = None,
+        factors: list[Any] | None = None,
     ) -> MonitorResult:
         cache_key = f"signal:{symbol}:{interval}:{strategy_name}"
         processed_bar_key = f"processed_bar_ts:{symbol}:{interval}:{strategy_name}"
+        position_opened_key = f"position_opened_bar_ts:{symbol}:{interval}:{strategy_name}"
+        cooldown_until_key = f"cooldown_until_bar_ts:{symbol}:{interval}:{strategy_name}"
 
         previous_signal = self.signal_store.get(cache_key)
         last_processed_bar_ts = self.signal_store.get(processed_bar_key)
@@ -172,7 +181,9 @@ class MonitoringService:
             )
 
         # Parameter optimization on completed bars only for stability
-        if parameter_space:
+        if parameters is not None:
+            best_parameters = parameters
+        elif parameter_space:
             best_parameters, _metrics, _ = self.research_service.optimize_parameters(
                 strategy_name=strategy_name,
                 bars=completed_bars,
@@ -187,7 +198,58 @@ class MonitoringService:
             strategy_name=strategy_name,
             bars=completed_bars,
             parameters=best_parameters,
+            current_position=0 if previous_signal is None else previous_signal,
+            data_context=(
+                MarketDataContext(
+                    {interval: completed_bars, **(auxiliary_bars_by_interval or {})},
+                    factors=factors,
+                )
+                if auxiliary_bars_by_interval or factors
+                else None
+            ),
         )
+
+        # Bad or stale data can never create/increase exposure.  A current
+        # position may still be closed, which is safer than freezing it.
+        quality_delta = INTERVAL_TO_DELTA.get(interval.lower())
+        quality_at = datetime.now(timezone.utc)
+        # Historical/replay data is assessed at its own final close; live data
+        # is assessed at wall time and therefore becomes stale as expected.
+        if quality_delta is not None:
+            quality_at = min(quality_at, completed_bars[-1].datetime + quality_delta * 2)
+        quality = assess_bars(completed_bars, interval, quality_at)
+        if not quality.usable:
+            prior = 0 if previous_signal is None else previous_signal
+            if prior == 0 or confirmed_signal != prior:
+                logger.warning("Data quality gate (%s): blocking new exposure", quality.reason)
+                confirmed_signal = 0
+
+        # Apply the same versioned holding/cooldown rules as the event-driven
+        # backtest. Stored timestamps keep the rule stable across process
+        # restarts without making it dependent on an in-memory loop counter.
+        effective_previous_for_governance = 0 if previous_signal is None else previous_signal
+        interval_seconds = int(quality_delta.total_seconds()) if quality_delta else 0
+        min_holding_bars = max(0, int(best_parameters.get("min_holding_bars", 0)))
+        cooldown_bars = max(0, int(best_parameters.get("cooldown_bars", 0)))
+        if interval_seconds:
+            cooldown_until = self.signal_store.get(cooldown_until_key) or 0
+            if effective_previous_for_governance == 0 and confirmed_signal != 0 and completed_bar_ts < int(cooldown_until):
+                confirmed_signal = 0
+            elif effective_previous_for_governance != 0 and confirmed_signal != effective_previous_for_governance:
+                opened_at = self.signal_store.get(position_opened_key)
+                held_bars = (
+                    (completed_bar_ts - int(opened_at)) // interval_seconds
+                    if opened_at is not None
+                    else min_holding_bars
+                )
+                if held_bars < min_holding_bars:
+                    confirmed_signal = effective_previous_for_governance
+                elif cooldown_bars:
+                    confirmed_signal = 0
+                    self.signal_store.set(
+                        cooldown_until_key,
+                        completed_bar_ts + cooldown_bars * interval_seconds,
+                    )
 
         self.risk_manager.validate_symbol(symbol)
 
@@ -233,15 +295,25 @@ class MonitoringService:
                 logger.error(f"Failed to send confirmation notification: {e}")
 
         execution_error = None
+        execution_mode = execution_mode or getattr(
+            self.research_service.settings.research, "execution_mode", "notify_only"
+        )
         if instructions:
-            try:
-                self.order_executor.execute(instructions)
-            except Exception as e:
-                execution_error = str(e)
-                logger.error(f"Order execution failed: {e}")
+            # This platform release is intentionally shadow/notification only.
+            # Keep the requested mode in status for observability, but never
+            # let an instance configuration bypass the portfolio safety gate.
+            logger.info(
+                "orders intentionally suppressed (requested execution mode=%s); "
+                "portfolio runtime is notify-only",
+                execution_mode,
+            )
 
         self.signal_store.set(cache_key, confirmed_signal)
         self.signal_store.set(processed_bar_key, completed_bar_ts)
+        if effective_prev == 0 and confirmed_signal != 0:
+            self.signal_store.set(position_opened_key, completed_bar_ts)
+        elif effective_prev != 0 and confirmed_signal == 0:
+            self.signal_store.set(position_opened_key, 0)
 
         self._save_live_status(
             strategy_name=strategy_name,
@@ -268,6 +340,53 @@ class MonitoringService:
             notification_sent=notification_sent,
             error=execution_error
         )
+
+    def monitor_instance_once(
+        self,
+        *,
+        instance_id: str,
+        runtime: StrategyRuntimeService,
+        volume: float,
+        lookback_bars: int = 120,
+    ) -> MonitorResult:
+        """Run a persisted instance against the version active at its last closed candle."""
+        instance = runtime.repository.get_instance(instance_id)
+        if instance is None:
+            raise ValueError(f"Unknown strategy instance: {instance_id}")
+        bars = self.market_data_repository.fetch_latest_bars(
+            instance.instrument.symbol, instance.primary_interval.value,
+            limit=lookback_bars, exchange=instance.instrument.exchange,
+        )
+        completed = self._completed_bars(bars, instance.primary_interval.value)
+        if not completed:
+            raise ValueError("No completed bars available for monitoring.")
+        delta = INTERVAL_TO_DELTA.get(instance.primary_interval.value)
+        if delta is None:
+            raise ValueError(f"Unsupported monitoring interval: {instance.primary_interval.value}")
+        resolved = runtime.resolve(instance.id, completed[-1].datetime + delta)
+        result = self.monitor_once(
+            strategy_name=resolved.version.strategy_name,
+            symbol=instance.instrument.symbol,
+            interval=instance.primary_interval.value,
+            parameters=resolved.version.parameters,
+            volume=volume,
+            lookback_bars=lookback_bars,
+            execution_mode=instance.execution_mode,
+            auxiliary_bars_by_interval={
+                auxiliary.value: self.market_data_repository.fetch_latest_bars(
+                    instance.instrument.symbol,
+                    auxiliary.value,
+                    limit=lookback_bars,
+                    exchange=instance.instrument.exchange,
+                )
+                for auxiliary in instance.auxiliary_intervals
+            },
+            factors=runtime.repository.factors_available_at(
+                instance.instrument, completed[-1].datetime + delta
+            ),
+        )
+        result.strategy_version_id = resolved.version.id
+        return result
 
     def _completed_bars(self, bars: list[Any], interval: str) -> list[Any]:
         interval_lower = interval.lower()

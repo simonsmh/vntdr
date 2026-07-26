@@ -7,12 +7,23 @@ from types import SimpleNamespace
 
 from typer.testing import CliRunner
 
-from vntdr.cli import CommandContext, app
+from vntdr.cli import CommandContext, _build_research_config, app
 from vntdr.config import Settings
 from vntdr.models import HealthCheckResult, MonitorResult, SyncResult
 from vntdr.services.config_service import ConfigService
 
 runner = CliRunner()
+
+
+def test_validation_research_config_can_lock_return_as_selection_target() -> None:
+    config = _build_research_config(
+        strategy="multi_factor", symbol="TV:XAUUSD", exchange="TRADINGVIEW",
+        interval="4h", start="2026-01-01T00:00:00+00:00",
+        end="2026-02-01T00:00:00+00:00", mode="walk-forward",
+        parameter_space={"trend_window": [30, 50]}, train_window=10,
+        test_window=5, optimize_target="return",
+    )
+    assert config.optimize_target == "return"
 
 
 class FakeSignalStore:

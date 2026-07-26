@@ -55,3 +55,29 @@ def test_clean_bars_sorts_deduplicates_and_fills_gaps() -> None:
     assert result.bars[1].is_synthetic is True
     assert result.bars[1].open == 100
     assert result.bars[2].close == 103
+
+
+def test_clean_bars_does_not_fill_weekend_for_weekday_calendar() -> None:
+    payloads = [
+        {
+            "symbol": "TV:QQQ", "exchange": "TRADINGVIEW", "interval": "1h",
+            "datetime": "2026-01-02T20:00:00+00:00",
+            "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1,
+        },
+        {
+            "symbol": "TV:QQQ", "exchange": "TRADINGVIEW", "interval": "1h",
+            "datetime": "2026-01-05T14:00:00+00:00",
+            "open": 2, "high": 2, "low": 2, "close": 2, "volume": 1,
+        },
+    ]
+
+    result = clean_bars(
+        payloads,
+        interval="1h",
+        fill_missing=True,
+        calendar="weekday",
+    )
+
+    assert result.gaps_detected == 0
+    assert result.gaps_filled == 0
+    assert len(result.bars) == 2
