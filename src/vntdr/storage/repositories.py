@@ -496,6 +496,27 @@ class ResearchRunRepository:
             row.status,
         )
 
+    def list_research_runs(
+        self, *, symbol: str | None = None, limit: int = 20
+    ) -> list[tuple[int, ResearchReport, str]]:
+        with self.database.session() as session:
+            query = select(ResearchRunORM).order_by(ResearchRunORM.id.desc()).limit(limit)
+            if symbol is not None:
+                query = query.where(ResearchRunORM.symbol == symbol)
+            rows = session.scalars(query).all()
+        return [
+            (
+                int(row.id),
+                ResearchReport(
+                    strategy_name=row.strategy_name, symbol=row.symbol, interval=row.interval,
+                    mode=row.mode, metrics=row.metrics, best_parameters=row.best_parameters,
+                    top_results=row.top_results,
+                ),
+                row.status,
+            )
+            for row in rows
+        ]
+
     async def create_research_run_async(self, report: ResearchReport, config: dict[str, Any]) -> int:
         return await asyncio.get_event_loop().run_in_executor(
             self._executor,

@@ -742,6 +742,25 @@ def ablate_strategy_command(
         )
 
 
+@app.command("research-runs")
+def research_runs_command(
+    symbol: str | None = typer.Option(None),
+    limit: int = typer.Option(20, min=1, max=100),
+) -> None:
+    """List persisted research evidence IDs used by version approval."""
+    settings = Settings.from_env()
+    settings.validate_for("backtest")
+    rows = create_command_context(settings).research_run_repository.list_research_runs(
+        symbol=symbol, limit=limit,
+    )
+    for run_id, report, status in rows:
+        typer.echo(
+            f"{run_id}\t{status}\t{report.mode}\t{report.strategy_name}\t"
+            f"{report.symbol}\t{report.interval}\treturn={report.metrics.get('total_return', 0):.4%}\t"
+            f"drawdown={report.metrics.get('max_drawdown', 0):.4%}"
+        )
+
+
 @app.command("validate-strategy")
 def validate_strategy_command(
     strategy: str = typer.Option(...),
