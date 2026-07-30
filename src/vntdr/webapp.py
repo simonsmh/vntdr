@@ -33,6 +33,8 @@ from vntdr.storage.repositories import (
     ResearchRunRepository,
     StrategyRepository,
 )
+from vntdr.strategies.registry import available_strategy_names, strategy_configs
+from vntdr.strategies.indicators import kdj_series, rolling_mean, rsi_series
 
 # ── 工具函数 ──────────────────────────────────────────────────────────
 
@@ -99,6 +101,8 @@ def _parse_params(text: str) -> dict[str, Any]:
 
 
 def _parse_space_value(v: Any) -> list[Any]:
+    if isinstance(v, (list, tuple)):
+        return list(v)
     if not isinstance(v, str):
         return [v]
     
@@ -193,6 +197,16 @@ PARAM_LABELS = {
     "signal_length": "信号线周期",
     "trend_window":  "趋势窗口",
     "lookback":      "回看周期",
+    "k_period":      "K周期",
+    "d_period":      "D周期",
+    "j_period":      "J周期",
+    "oversold":      "超卖阈值",
+    "overbought":    "超买阈值",
+    "rsi_period":    "RSI周期",
+    "exit_midline":  "退出中轴",
+    "volume_window": "成交量均线周期",
+    "volume_multiplier": "放量倍数",
+    "price_window":  "价格突破窗口",
 }
 
 
@@ -257,6 +271,24 @@ STRATEGY_PARAMS: dict[str, dict[str, Any]] = {
         },
     },
 }
+
+# Keep the legacy UI metadata above compatible while allowing new strategy
+# modules to register themselves without another hard-coded webapp branch.
+for _strategy_name, _strategy_config in strategy_configs().items():
+    STRATEGY_PARAMS.setdefault(_strategy_name, _strategy_config)
+
+
+def _enabled_strategy_names(cs: ConfigService | None = None) -> list[str]:
+    """Return the persisted active catalogue, or every discovered strategy."""
+
+    names = [name for name in available_strategy_names() if name in STRATEGY_PARAMS]
+    if cs is None:
+        cs = _get_config_service()
+    configured = cs.get("research.enabled_strategies")
+    if not isinstance(configured, list):
+        return names
+    enabled = [name for name in configured if name in names]
+    return enabled or names
 
 
 def _default_space_text(strategy_name: str) -> str:
@@ -673,8 +705,11 @@ def _data_health_df() -> pd.DataFrame:
 
 # ── K线 + MACD 指标图 ────────────────────────────────────────────────
 
-def _build_kline_macd_chart(bars, signals, fast_length, slow_length, signal_length):
-    """生成 K线蜡烛图 + 买卖信号 + MACD 指标（上下两栏）。"""
+def _build_kline_macd_chart(
+    bars, signals, fast_length, slow_length, signal_length,
+    strategy_name="cm_macd_ult_mtf", indicator_parameters=None,
+):
+    """生成 K线蜡烛图 + 买卖信号 + 当前策略对应指标。"""
     dts    = [b.datetime for b in bars]
     opens  = [b.open    for b in bars]
     highs  = [b.high    for b in bars]
@@ -769,32 +804,44 @@ def _build_kline_macd_chart(bars, signals, fast_length, slow_length, signal_leng
             row=1, col=1,
         )
 
-    # ── 下栏：MACD 柱状图 + MACD线 + 信号线 ─────────────────────
-    hist_colors = ["#00C853" if v >= 0 else "#FF1744" for v in histogram]
-    fig.add_trace(
-        go.Bar(
-            x=dts, y=histogram, name="MACD柱",
-            marker_color=hist_colors, opacity=0.75,
-        ),
-        row=2, col=1,
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=dts, y=macd_line, mode="lines", name="MACD",
-            line=dict(width=1.2, color="#FF9800"),
-        ),
-        row=2, col=1,
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=dts, y=sig_line, mode="lines", name="信号线",
-            line=dict(width=1.2, color="#AB47BC"),
-        ),
-        row=2, col=1,
-    )
+    # ── 下栏：展示当前策略实际使用的指标 ───────────────────────
+    indicator_parameters = indicator_parameters or {}
+    indicator_title = "MACD"
+    if strategy_name == "kdj":
+        k_values, d_values, j_values = kdj_series(
+            bars,
+            int(indicator_parameters.get("k_period", 9)),
+            int(indicator_parameters.get("d_period", 3)),
+            int(indicator_parameters.get("j_period", 3)),
+        )
+        for values, name, color in (
+            (k_values, "K", "#FF9800"),
+            (d_values, "D", "#AB47BC"),
+            (j_values, "J", "#00E5FF"),
+        ):
+            fig.add_trace(go.Scatter(x=dts, y=values, mode="lines", name=name, line=dict(width=1.2, color=color)), row=2, col=1)
+        indicator_title = "KDJ"
+    elif strategy_name == "rsi":
+        values = rsi_series(closes, int(indicator_parameters.get("rsi_period", 14)))
+        fig.add_trace(go.Scatter(x=dts, y=values, mode="lines", name="RSI", line=dict(width=1.4, color="#FF9800")), row=2, col=1)
+        fig.add_hline(y=float(indicator_parameters.get("oversold", 30)), line_dash="dot", line_color="#00C853", row=2, col=1)
+        fig.add_hline(y=float(indicator_parameters.get("overbought", 70)), line_dash="dot", line_color="#FF1744", row=2, col=1)
+        indicator_title = "RSI"
+    elif strategy_name == "volume":
+        volumes = [bar.volume for bar in bars]
+        window = int(indicator_parameters.get("volume_window", 20))
+        average = [rolling_mean(volumes, window, index) for index in range(len(bars))]
+        fig.add_trace(go.Bar(x=dts, y=volumes, name="成交量", marker_color="#42A5F5", opacity=0.65), row=2, col=1)
+        fig.add_trace(go.Scatter(x=dts, y=average, mode="lines", name="成交量均线", line=dict(width=1.3, color="#FF9800")), row=2, col=1)
+        indicator_title = "成交量"
+    else:
+        hist_colors = ["#00C853" if v >= 0 else "#FF1744" for v in histogram]
+        fig.add_trace(go.Bar(x=dts, y=histogram, name="MACD柱", marker_color=hist_colors, opacity=0.75), row=2, col=1)
+        fig.add_trace(go.Scatter(x=dts, y=macd_line, mode="lines", name="MACD", line=dict(width=1.2, color="#FF9800")), row=2, col=1)
+        fig.add_trace(go.Scatter(x=dts, y=sig_line, mode="lines", name="信号线", line=dict(width=1.2, color="#AB47BC")), row=2, col=1)
 
     fig.update_layout(
-        title="K线走势  ·  买卖信号  ·  MACD指标",
+        title=f"K线走势  ·  买卖信号  ·  {indicator_title}指标",
         height=680,
         template="plotly_dark",
         xaxis_rangeslider_visible=False,
@@ -802,7 +849,7 @@ def _build_kline_macd_chart(bars, signals, fast_length, slow_length, signal_leng
         margin=dict(l=55, r=20, t=60, b=30),
     )
     fig.update_yaxes(title_text="价格", row=1, col=1)
-    fig.update_yaxes(title_text="MACD", row=2, col=1)
+    fig.update_yaxes(title_text=indicator_title, row=2, col=1)
     return fig
 
 
@@ -822,8 +869,11 @@ def main(port: int | None = None) -> None:
     cs = _get_config_service()
     cs._load_overrides()
     default_start, default_end = _default_dates(cs)
+    strategy_choices = _enabled_strategy_names(cs)
 
     initial_strategy = cs.get("research.default_strategy") or "cm_macd_ult_mtf"
+    if initial_strategy not in strategy_choices:
+        initial_strategy = strategy_choices[0] if strategy_choices else "cm_macd_ult_mtf"
     initial_symbol = cs.get("research.default_symbol") or "XAU-USDT-SWAP"
     initial_interval = cs.get("research.default_interval") or "4h"
     if isinstance(initial_interval, str):
@@ -908,7 +958,7 @@ def main(port: int | None = None) -> None:
                         gr.Markdown("### 🛠️ 市场与行情配置")
                         global_strategy = gr.Dropdown(
                             label="研究策略",
-                            choices=list(STRATEGY_PARAMS.keys()),
+                            choices=strategy_choices,
                             value=initial_strategy,
                         )
                         global_symbol = gr.Dropdown(
@@ -1026,8 +1076,8 @@ def main(port: int | None = None) -> None:
                             with gr.Row():
                                 manage_strategy = gr.Dropdown(
                                     label="策略 (Strategy)",
-                                    choices=list(STRATEGY_PARAMS.keys()),
-                                    value="cm_macd_ult_mtf",
+                                    choices=strategy_choices,
+                                    value=initial_strategy,
                                     interactive=True,
                                 )
                                 manage_symbol = gr.Dropdown(
@@ -1114,8 +1164,8 @@ def main(port: int | None = None) -> None:
                         )
                         add_strategy = gr.Dropdown(
                             label="策略",
-                            choices=list(STRATEGY_PARAMS.keys()),
-                            value="cm_macd_ult_mtf",
+                            choices=strategy_choices,
+                            value=initial_strategy,
                             scale=2,
                         )
                         add_volume = gr.Number(
@@ -1210,7 +1260,14 @@ def main(port: int | None = None) -> None:
                         gr.Markdown("### ⚙️ 研究与默认参数")
                         cfg_strategy = gr.Dropdown(
                             label="默认策略",
+                            choices=strategy_choices,
+                        )
+                        cfg_enabled_strategies = gr.Dropdown(
+                            label="启用的策略（可动态增减）",
                             choices=list(STRATEGY_PARAMS.keys()),
+                            multiselect=True,
+                            value=strategy_choices,
+                            info="取消勾选会从研究与新增监控的策略列表移除；已部署监控不会被强制删除。",
                         )
                         cfg_symbol = gr.Dropdown(
                             label="默认交易对",
@@ -1318,6 +1375,8 @@ def main(port: int | None = None) -> None:
                 chart = _build_kline_macd_chart(
                     bars[: len(outcome.signals)],
                     outcome.signals, fl, sl, sg,
+                    strategy_name=strategy_name,
+                    indicator_parameters=parameters,
                 )
 
                 trades_records = []
@@ -1672,8 +1731,8 @@ def main(port: int | None = None) -> None:
 
         def update_param_visibility(strategy_name):
             show_lookback = strategy_name == "demo_momentum"
-            show_macd     = strategy_name == "cm_macd_ult_mtf"
-            return gr.update(visible=show_lookback), gr.update(visible=show_macd)
+            show_params = not show_lookback
+            return gr.update(visible=show_lookback), gr.update(visible=show_params)
 
         def toggle_space_visibility(auto_fit):
             return gr.update(visible=not auto_fit)
@@ -2039,10 +2098,31 @@ def main(port: int | None = None) -> None:
                 gr.update(value=defaults.get("trade_mode", "both")),
             )
 
+        def refresh_strategy_choices(enabled, global_value, manage_value, add_value, default_value):
+            configured = enabled if isinstance(enabled, list) else []
+            names = [name for name in configured if name in STRATEGY_PARAMS]
+            if not names:
+                names = available_strategy_names()
+
+            def keep_or_first(value):
+                return value if value in names else names[0]
+
+            return (
+                gr.update(choices=names, value=keep_or_first(global_value)),
+                gr.update(choices=names, value=keep_or_first(manage_value)),
+                gr.update(choices=names, value=keep_or_first(add_value)),
+                gr.update(choices=names, value=keep_or_first(default_value)),
+            )
+
         global_strategy.change(
             update_strategy_change,
             inputs=[global_strategy],
             outputs=[opt_space, bt_params_lookback, bt_params_macd, bt_trade_mode],
+        )
+        cfg_enabled_strategies.change(
+            refresh_strategy_choices,
+            inputs=[cfg_enabled_strategies, global_strategy, manage_strategy, add_strategy, cfg_strategy],
+            outputs=[global_strategy, manage_strategy, add_strategy, cfg_strategy],
         )
         opt_auto_fit.change(toggle_space_visibility, inputs=[opt_auto_fit], outputs=[opt_space])
 
@@ -2050,6 +2130,7 @@ def main(port: int | None = None) -> None:
 
         CFG_KEYS = [
             "research.default_strategy",
+            "research.enabled_strategies",
             "research.default_symbol",
             "research.default_interval",
             "research.default_order_size",
@@ -2071,7 +2152,7 @@ def main(port: int | None = None) -> None:
 
         cfg_outputs = [
             cfg_status,
-            cfg_strategy, cfg_symbol, cfg_interval,
+            cfg_strategy, cfg_enabled_strategies, cfg_symbol, cfg_interval,
             cfg_order_size, cfg_rank_hours,
             cfg_maker_fee, cfg_taker_fee, cfg_use_maker, cfg_optimize_target,
             cfg_max_capital, cfg_max_exposure, cfg_max_drawdown,
@@ -2092,13 +2173,18 @@ def main(port: int | None = None) -> None:
             from pydantic import SecretStr
             for k in CFG_KEYS:
                 val = cs.get(k)
+                if k == "research.enabled_strategies":
+                    val = _enabled_strategy_names(cs)
                 if isinstance(val, SecretStr):
                     val = val.get_secret_value()
                 if k == "research.default_interval" and isinstance(val, str):
                     val = val.lower()
                 vals.append(val)
 
+            enabled_names = _enabled_strategy_names(cs)
             g_strat = cs.get("research.default_strategy") or "cm_macd_ult_mtf"
+            if g_strat not in enabled_names:
+                g_strat = enabled_names[0]
             g_sym = cs.get("research.default_symbol") or "XAU-USDT-SWAP"
             g_int = cs.get("research.default_interval") or "4h"
             if isinstance(g_int, str):
@@ -2127,7 +2213,7 @@ def main(port: int | None = None) -> None:
             ]
 
         def save_settings(
-            strategy, symbol, interval,
+            strategy, enabled_strategies, symbol, interval,
             order_size, rank_hours,
             maker_fee, taker_fee, use_maker, optimize_target,
             max_capital, max_exposure, max_drawdown,
@@ -2135,10 +2221,17 @@ def main(port: int | None = None) -> None:
             api_key, secret_key, passphrase, demo_trading,
         ):
             cs = _get_config_service()
+            enabled_strategies = [
+                name for name in (enabled_strategies or []) if name in STRATEGY_PARAMS
+            ]
+            if not enabled_strategies:
+                enabled_strategies = available_strategy_names()
+            if strategy not in enabled_strategies:
+                strategy = enabled_strategies[0]
             if isinstance(interval, str):
                 interval = interval.lower()
             values = [
-                strategy, symbol, interval,
+                strategy, enabled_strategies, symbol, interval,
                 order_size, rank_hours,
                 maker_fee, taker_fee, use_maker, optimize_target,
                 max_capital, max_exposure, max_drawdown,
@@ -2157,11 +2250,16 @@ def main(port: int | None = None) -> None:
             vals = []
             for k in CFG_KEYS:
                 val = cs.get(k)
+                if k == "research.enabled_strategies":
+                    val = _enabled_strategy_names(cs)
                 if k == "research.default_interval" and isinstance(val, str):
                     val = val.lower()
                 vals.append(val)
 
+            enabled_names = _enabled_strategy_names(cs)
             g_strat = cs.get("research.default_strategy") or "cm_macd_ult_mtf"
+            if g_strat not in enabled_names:
+                g_strat = enabled_names[0]
             g_sym = cs.get("research.default_symbol") or "XAU-USDT-SWAP"
             g_int = cs.get("research.default_interval") or "4h"
             if isinstance(g_int, str):
@@ -2196,11 +2294,16 @@ def main(port: int | None = None) -> None:
             vals = []
             for k in CFG_KEYS:
                 val = cs.get(k)
+                if k == "research.enabled_strategies":
+                    val = _enabled_strategy_names(cs)
                 if k == "research.default_interval" and isinstance(val, str):
                     val = val.lower()
                 vals.append(val)
 
+            enabled_names = _enabled_strategy_names(cs)
             g_strat = cs.get("research.default_strategy") or "cm_macd_ult_mtf"
+            if g_strat not in enabled_names:
+                g_strat = enabled_names[0]
             g_sym = cs.get("research.default_symbol") or "XAU-USDT-SWAP"
             g_int = cs.get("research.default_interval") or "4h"
             if isinstance(g_int, str):
@@ -2231,7 +2334,7 @@ def main(port: int | None = None) -> None:
         cfg_save_btn.click(
             save_settings,
             inputs=[
-                cfg_strategy, cfg_symbol, cfg_interval,
+                cfg_strategy, cfg_enabled_strategies, cfg_symbol, cfg_interval,
                 cfg_order_size, cfg_rank_hours,
                 cfg_maker_fee, cfg_taker_fee, cfg_use_maker, cfg_optimize_target,
                 cfg_max_capital, cfg_max_exposure, cfg_max_drawdown,
@@ -2239,9 +2342,21 @@ def main(port: int | None = None) -> None:
                 cfg_okx_key, cfg_okx_secret, cfg_okx_passphrase, cfg_okx_demo,
             ],
             outputs=cfg_outputs,
+        ).then(
+            refresh_strategy_choices,
+            inputs=[cfg_enabled_strategies, global_strategy, manage_strategy, add_strategy, cfg_strategy],
+            outputs=[global_strategy, manage_strategy, add_strategy, cfg_strategy],
         )
-        cfg_reset_btn.click(reset_settings, outputs=cfg_outputs)
-        cfg_reload_btn.click(load_settings, outputs=cfg_outputs)
+        cfg_reset_btn.click(reset_settings, outputs=cfg_outputs).then(
+            refresh_strategy_choices,
+            inputs=[cfg_enabled_strategies, global_strategy, manage_strategy, add_strategy, cfg_strategy],
+            outputs=[global_strategy, manage_strategy, add_strategy, cfg_strategy],
+        )
+        cfg_reload_btn.click(load_settings, outputs=cfg_outputs).then(
+            refresh_strategy_choices,
+            inputs=[cfg_enabled_strategies, global_strategy, manage_strategy, add_strategy, cfg_strategy],
+            outputs=[global_strategy, manage_strategy, add_strategy, cfg_strategy],
+        )
         
         live_refresh_btn.click(
             fetch_live_status,
@@ -2336,7 +2451,7 @@ def main(port: int | None = None) -> None:
             run_backtest_dispatch,
             inputs=[
                 global_strategy, global_symbol, global_interval, global_start, global_end,
-                bt_params_lookback, bt_params_macd,
+                bt_trade_mode, bt_params_lookback, bt_params_macd,
             ],
             outputs=[bt_status, bt_metrics_table, bt_params_table, bt_chart, bt_trades_table, visual_tabs],
         ).then(

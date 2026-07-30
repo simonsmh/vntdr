@@ -22,11 +22,11 @@ def test_trade_mode_filtering(tmp_path, env_map, sample_xau_bar_payloads):
         "trend_window": 3,
     }
     
+    # Direction is a strategy parameter, not a process-wide setting.
     # 1. Both Long and Short (default)
     settings = Settings.from_mapping({
         **env_map,
         "VNTDR_DATABASE_URL": f"sqlite+pysqlite:///{db_path}",
-        "VNTDR_TRADE_MODE": "both",
     })
     service = ResearchService(
         settings=settings,
@@ -39,31 +39,15 @@ def test_trade_mode_filtering(tmp_path, env_map, sample_xau_bar_payloads):
     assert -1 in outcome_both.signals
     
     # 2. Long Only
-    settings_long = Settings.from_mapping({
-        **env_map,
-        "VNTDR_DATABASE_URL": f"sqlite+pysqlite:///{db_path}",
-        "VNTDR_TRADE_MODE": "long_only",
-    })
-    service_long = ResearchService(
-        settings=settings_long,
-        market_data_repository=repository,
-        research_run_repository=ResearchRunRepository(database),
+    outcome_long = service._execute_backtest(
+        bars, "cm_macd_ult_mtf", {**parameters, "trade_mode": "long_only"}
     )
-    outcome_long = service_long._execute_backtest(bars, "cm_macd_ult_mtf", parameters)
     assert 1 in outcome_long.signals
     assert -1 not in outcome_long.signals
     
     # 3. Short Only
-    settings_short = Settings.from_mapping({
-        **env_map,
-        "VNTDR_DATABASE_URL": f"sqlite+pysqlite:///{db_path}",
-        "VNTDR_TRADE_MODE": "short_only",
-    })
-    service_short = ResearchService(
-        settings=settings_short,
-        market_data_repository=repository,
-        research_run_repository=ResearchRunRepository(database),
+    outcome_short = service._execute_backtest(
+        bars, "cm_macd_ult_mtf", {**parameters, "trade_mode": "short_only"}
     )
-    outcome_short = service_short._execute_backtest(bars, "cm_macd_ult_mtf", parameters)
     assert 1 not in outcome_short.signals
     assert -1 in outcome_short.signals

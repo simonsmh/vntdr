@@ -57,7 +57,13 @@ class Strategy(ReviewedStrategyBase):
     ) -> int:
         defaults = {**DEFAULT_PARAMETERS, **parameters}
         
-        cache_key = (id(bars), tuple(sorted(defaults.items())))
+        # trade_mode is applied by the execution service after raw indicator
+        # signals are calculated, so it must not create a second indicator
+        # cache or change the raw CM MACD points.
+        signal_parameters = {
+            key: value for key, value in defaults.items() if key != "trade_mode"
+        }
+        cache_key = (id(bars), tuple(sorted(signal_parameters.items())))
         fingerprint = cls._bars_fingerprint(bars)
         cached = cls._cache.get(cache_key)
         if cached is None or cached[0] != fingerprint:

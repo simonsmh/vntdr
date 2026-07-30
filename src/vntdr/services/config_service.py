@@ -196,3 +196,7 @@ class ConfigService:
         """重置所有配置为默认值"""
         self._overrides = {}
         self._save_overrides()
+        # The same process (notably the Gradio worker) must immediately see
+        # environment defaults too; deleting the file alone leaves the old
+        # in-memory values in place.
+        self.settings = Settings.from_env()
