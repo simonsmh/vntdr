@@ -2180,8 +2180,6 @@ def main(port: int | None = None) -> None:
             macd_p_text = "\n".join(f"{k}={v}" for k, v in macd_p.items())
             selected_p = current_params.get(g_strat, {}) or STRATEGY_PARAMS.get(g_strat, {}).get("defaults", {})
             selected_trade_mode = selected_p.get("trade_mode", "both")
-            selected_p = current_params.get(g_strat, {}) or STRATEGY_PARAMS.get(g_strat, {}).get("defaults", {})
-            selected_trade_mode = selected_p.get("trade_mode", "both")
 
             df, choices, val = _get_targets_df_and_choices()
             return [f"已保存 {len(saved)} 项配置并同步到全局回测配置"] + vals + [
@@ -2219,6 +2217,8 @@ def main(port: int | None = None) -> None:
             if not macd_p:
                 macd_p = STRATEGY_PARAMS.get("cm_macd_ult_mtf", {}).get("defaults", {})
             macd_p_text = "\n".join(f"{k}={v}" for k, v in macd_p.items())
+            selected_p = current_params.get(g_strat, {}) or STRATEGY_PARAMS.get(g_strat, {}).get("defaults", {})
+            selected_trade_mode = selected_p.get("trade_mode", "both")
 
             df, choices, val = _get_targets_df_and_choices()
             return ["已重置全部配置且同步到全局回测配置"] + vals + [
