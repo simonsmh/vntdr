@@ -414,12 +414,41 @@ def _get_config_service():
 
 _ETF_ZONE = ZoneInfo("Asia/Shanghai")
 
+ETF_DISPLAY_NAMES = {
+    "588200": "嘉实上证科创板芯片ETF",
+    "510300": "华泰柏瑞沪深300ETF",
+    "588170": "华夏上证科创板半导体材料设备主题ETF",
+    "588080": "易方达上证科创板50ETF",
+    "159845": "华夏中证1000ETF",
+    "159941": "广发纳指100ETF",
+    "512400": "南方有色金属ETF",
+}
+
+
+def _etf_name(symbol: Any) -> str:
+    return ETF_DISPLAY_NAMES.get(str(symbol).zfill(6), "未登记ETF")
+
 
 def _etf_default_watchlist_text() -> str:
     configured = os.getenv("VNTDR_ETF_WATCHLIST")
     if configured:
         return configured
     return ",".join(f"{target.symbol}:{target.market}" for target in DEFAULT_ETF_WATCHLIST)
+
+
+def _etf_filter_choice_pairs(watchlist_text: str) -> list[tuple[str, str]]:
+    try:
+        targets = parse_watchlist(watchlist_text)
+    except ValueError:
+        targets = DEFAULT_ETF_WATCHLIST
+    return [("全部 ETF", "")] + [
+        (f"{target.symbol} · {_etf_name(target.symbol)}", target.symbol)
+        for target in targets
+    ]
+
+
+def _etf_filter_choices(watchlist_text: str):
+    return gr.update(choices=_etf_filter_choice_pairs(watchlist_text), value="")
 
 
 def _etf_repository() -> EtfMoneyFlowRepository:
@@ -447,14 +476,15 @@ def _format_etf_timestamp(value: Any) -> str:
 def _etf_display_frames(
     rows: list[dict[str, Any]],
     runs: list[dict[str, Any]],
+    selected_symbol: str | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, go.Figure]:
     columns = [
-        "标的", "市场", "观测天数", "主力累计净流入", "主力正流入天数",
+        "标的代码", "标的名称", "市场", "观测天数", "主力累计净流入", "主力正流入天数",
         "主力正流入占比", "最新主力净流入", "最新主力净流入率", "最新收盘价",
         "最新涨跌幅", "最后交易日",
     ]
     daily_columns = [
-        "交易日", "标的", "市场", "主力净流入", "主力净流入率", "超大单净流入",
+        "交易日", "标的代码", "标的名称", "市场", "主力净流入", "主力净流入率", "超大单净流入",
         "大单净流入", "大单净流入率", "收盘价", "涨跌幅", "可用时间", "抓取时间", "重试次数",
     ]
     run_columns = [
@@ -486,6 +516,7 @@ def _etf_display_frames(
         observation_days = int(main.notna().sum())
         summary_rows.append([
             symbol,
+            _etf_name(symbol),
             str(latest.get("market", "")),
             observation_days,
             float(main.sum()),
@@ -505,19 +536,23 @@ def _etf_display_frames(
     for column in ("最新主力净流入", "最新主力净流入率", "最新收盘价", "最新涨跌幅"):
         summary[column] = pd.to_numeric(summary[column], errors="coerce").round(4)
 
-    daily = raw.rename(columns={
-        "trade_date": "交易日", "symbol": "标的", "market": "市场",
+    display_raw = raw
+    if selected_symbol:
+        display_raw = raw[raw["symbol"] == str(selected_symbol).zfill(6)]
+    daily = display_raw.rename(columns={
+        "trade_date": "交易日", "symbol": "标的代码", "market": "市场",
         "main_net_inflow": "主力净流入", "main_inflow_ratio": "主力净流入率",
         "extra_large_net_inflow": "超大单净流入", "large_net_inflow": "大单净流入",
         "large_inflow_ratio": "大单净流入率", "close_price": "收盘价", "pct_change": "涨跌幅",
         "available_at": "可用时间", "fetched_at": "抓取时间", "retry_count": "重试次数",
     })
+    daily.insert(2, "标的名称", daily["标的代码"].map(_etf_name))
     daily["交易日"] = daily["交易日"].dt.date
     for column in ("主力净流入", "主力净流入率", "超大单净流入", "大单净流入", "大单净流入率", "收盘价", "涨跌幅"):
         daily[column] = pd.to_numeric(daily[column], errors="coerce").round(4)
     daily["可用时间"] = daily["可用时间"].map(_format_etf_timestamp)
     daily["抓取时间"] = daily["抓取时间"].map(_format_etf_timestamp)
-    daily = daily[daily_columns].sort_values(["交易日", "标的"], ascending=[False, True])
+    daily = daily[daily_columns].sort_values(["交易日", "标的代码"], ascending=[False, True])
 
     run_rows = []
     for run in runs:
@@ -532,14 +567,17 @@ def _etf_display_frames(
     runs_df = pd.DataFrame(run_rows, columns=run_columns)
 
     chart = go.Figure()
-    for symbol, group in raw.groupby("symbol", sort=True):
+    for symbol, group in display_raw.groupby("symbol", sort=True):
         chart.add_trace(go.Scatter(
             x=group["trade_date"], y=group["main_net_inflow"],
-            mode="lines+markers", name=str(symbol),
+            mode="lines+markers", name=f"{symbol} · {_etf_name(symbol)}",
         ))
     chart.add_hline(y=0, line_dash="dot", line_color="#888")
     chart.update_layout(
-        title="观察池主力净流入趋势（数据库已入库数据）",
+        title=(
+            "观察池主力净流入趋势（数据库已入库数据）"
+            if not selected_symbol else f"{selected_symbol} · {_etf_name(selected_symbol)} 主力净流入趋势"
+        ),
         height=420, template="plotly_dark", hovermode="x unified",
         xaxis_title="交易日", yaxis_title="主力净流入",
         margin=dict(l=55, r=20, t=55, b=35),
@@ -547,7 +585,11 @@ def _etf_display_frames(
     return summary, daily, runs_df, chart
 
 
-def _load_etf_panel(watchlist_text: str, lookback_days: float | int | None):
+def _load_etf_panel(
+    watchlist_text: str,
+    lookback_days: float | int | None,
+    selected_symbol: str | None = None,
+):
     """Read ETF flow rows without touching the public data source."""
     try:
         targets = parse_watchlist(watchlist_text)
@@ -563,7 +605,7 @@ def _load_etf_panel(watchlist_text: str, lookback_days: float | int | None):
         end_date=end_date,
     )
     runs = repository.fetch_latest_runs(limit=20)
-    summary, daily, runs_df, chart = _etf_display_frames(rows, runs)
+    summary, daily, runs_df, chart = _etf_display_frames(rows, runs, selected_symbol)
     if rows:
         status = f"✅ 已加载 {len(rows)} 条日频记录，区间 {start_date} 至 {end_date}。"
     else:
@@ -571,10 +613,16 @@ def _load_etf_panel(watchlist_text: str, lookback_days: float | int | None):
     if runs:
         latest = runs[0]
         status += f" 最近任务：{latest.get('status', '-')}（{_format_etf_timestamp(latest.get('started_at'))}）。"
+    if selected_symbol:
+        status += f" 当前明细筛选：{selected_symbol} · {_etf_name(selected_symbol)}。"
     return status, summary, daily, runs_df, chart
 
 
-def _ingest_etf_panel(watchlist_text: str, lookback_days: float | int | None):
+def _ingest_etf_panel(
+    watchlist_text: str,
+    lookback_days: float | int | None,
+    selected_symbol: str | None = None,
+):
     """Run one bounded collection attempt, then refresh all panel views."""
     try:
         targets = parse_watchlist(watchlist_text)
@@ -601,9 +649,11 @@ def _ingest_etf_panel(watchlist_text: str, lookback_days: float | int | None):
             lookback_days=days,
         ).run(start_date=start_date, end_date=end_date)
     except Exception as exc:  # noqa: BLE001 - surface source/config failures in the panel
-        panel = _load_etf_panel(watchlist_text, days)
+        panel = _load_etf_panel(watchlist_text, days, selected_symbol)
         return f"❌ 本次采集未完成（可重试）：{exc}\n\n{panel[0]}", *panel[1:]
-    status, summary, daily, runs_df, chart = _load_etf_panel(watchlist_text, days)
+    status, summary, daily, runs_df, chart = _load_etf_panel(
+        watchlist_text, days, selected_symbol
+    )
     outcome = result.get("status", "unknown")
     task_status = result.get("task_status", "unknown")
     status = (
@@ -1223,13 +1273,19 @@ def main(port: int | None = None) -> None:
                     etf_lookback = gr.Number(
                         label="面板回看天数", value=30, minimum=1, precision=0, scale=1,
                     )
+                etf_symbol_filter = gr.Dropdown(
+                    label="日频明细按标的筛选",
+                    choices=_etf_filter_choice_pairs(_etf_default_watchlist_text()),
+                    value="",
+                    info="摘要仍展示全部观察池；明细和趋势图按此筛选。",
+                )
                 with gr.Row():
                     etf_refresh_btn = gr.Button("🔄 刷新数据库视图", variant="secondary")
                     etf_ingest_btn = gr.Button("📥 立即采集并入库", variant="primary")
                 etf_status = gr.Markdown("点击刷新查看数据库中的 ETF 资金流。")
                 etf_summary_table = gr.Dataframe(
                     headers=[
-                        "标的", "市场", "观测天数", "主力累计净流入", "主力正流入天数",
+                        "标的代码", "标的名称", "市场", "观测天数", "主力累计净流入", "主力正流入天数",
                         "主力正流入占比", "最新主力净流入", "最新主力净流入率", "最新收盘价",
                         "最新涨跌幅", "最后交易日",
                     ],
@@ -1239,7 +1295,7 @@ def main(port: int | None = None) -> None:
                 etf_trend_plot = gr.Plot(label="主力净流入趋势")
                 etf_daily_table = gr.Dataframe(
                     headers=[
-                        "交易日", "标的", "市场", "主力净流入", "主力净流入率", "超大单净流入",
+                        "交易日", "标的代码", "标的名称", "市场", "主力净流入", "主力净流入率", "超大单净流入",
                         "大单净流入", "大单净流入率", "收盘价", "涨跌幅", "可用时间", "抓取时间", "重试次数",
                     ],
                     label="日频资金流明细",
@@ -2495,15 +2551,20 @@ def main(port: int | None = None) -> None:
             fetch_live_status,
             outputs=[live_health, live_config, live_account, live_positions, live_logs_table]
         )
+        etf_watchlist.change(
+            _etf_filter_choices,
+            inputs=[etf_watchlist],
+            outputs=[etf_symbol_filter],
+        )
         etf_outputs = [etf_status, etf_summary_table, etf_daily_table, etf_runs_table, etf_trend_plot]
         etf_refresh_btn.click(
             _load_etf_panel,
-            inputs=[etf_watchlist, etf_lookback],
+            inputs=[etf_watchlist, etf_lookback, etf_symbol_filter],
             outputs=etf_outputs,
         )
         etf_ingest_btn.click(
             _ingest_etf_panel,
-            inputs=[etf_watchlist, etf_lookback],
+            inputs=[etf_watchlist, etf_lookback, etf_symbol_filter],
             outputs=etf_outputs,
         )
         platform_refresh_btn.click(_platform_instances_df, outputs=[platform_instances])
@@ -2589,7 +2650,7 @@ def main(port: int | None = None) -> None:
             outputs=[bt_status, bt_metrics_table, bt_params_table, bt_chart, bt_trades_table, visual_tabs],
         ).then(
             _load_etf_panel,
-            inputs=[etf_watchlist, etf_lookback],
+            inputs=[etf_watchlist, etf_lookback, etf_symbol_filter],
             outputs=etf_outputs,
         )
 
