@@ -39,6 +39,10 @@ class ConfigService:
 
     def __init__(self, settings: Settings, config_file: Path | None = None):
         self.settings = settings
+        # Keep the startup/environment values as the reset baseline.  The
+        # Settings object is shared by the CLI/web worker, so later restores
+        # must update it in place rather than replacing the object.
+        self._base_settings = settings.model_copy(deep=True)
         self.config_file = config_file or Path.home() / ".vntdr" / "config_override.json"
         self.config_file.parent.mkdir(parents=True, exist_ok=True)
         self._overrides: dict[str, Any] = {}
@@ -46,13 +50,22 @@ class ConfigService:
 
     def _load_overrides(self) -> None:
         """加载覆盖的配置"""
+        self._overrides = {}
         if self.config_file.exists():
             try:
-                with open(self.config_file, "r", encoding="utf-8") as f:
-                    self._overrides = json.load(f)
-                self._apply_overrides()
-            except Exception:
-                self._overrides = {}
+                loaded = json.loads(self.config_file.read_text(encoding="utf-8"))
+            except (OSError, TypeError, ValueError):
+                loaded = {}
+            if isinstance(loaded, dict):
+                self._overrides = loaded
+        self._restore_base_settings()
+
+    def _restore_base_settings(self) -> None:
+        """Restore startup values and reapply the current overrides in place."""
+        restored = self._base_settings.model_copy(deep=True)
+        for field_name in type(self.settings).model_fields:
+            setattr(self.settings, field_name, getattr(restored, field_name))
+        self._apply_overrides()
 
     def _save_overrides(self) -> None:
         """保存覆盖的配置"""
@@ -66,9 +79,14 @@ class ConfigService:
 
     def _is_secret_field(self, model: Any, field_name: str) -> bool:
         from pydantic import SecretStr
-        if not hasattr(model, "model_fields"):
+
+        # ``model_fields`` is a class attribute in Pydantic 2. Accessing it
+        # through an instance emits a deprecation warning in 2.11 and will be
+        # removed in Pydantic 3.
+        model_fields = getattr(type(model), "model_fields", None)
+        if model_fields is None:
             return False
-        field_info = model.model_fields.get(field_name)
+        field_info = model_fields.get(field_name)
         if not field_info:
             return False
         ann = field_info.annotation
@@ -86,7 +104,9 @@ class ConfigService:
         if len(parts) == 1:
             # 顶级配置
             if hasattr(self.settings, parts[0]):
-                if self._is_secret_field(self.settings, parts[0]) and not isinstance(value, SecretStr):
+                if self._is_secret_field(self.settings, parts[0]) and not isinstance(
+                    value, SecretStr
+                ):
                     value = SecretStr(value) if value else None
                 setattr(self.settings, parts[0], value)
         elif len(parts) == 2:
@@ -187,8 +207,7 @@ class ConfigService:
         if key in self._overrides:
             del self._overrides[key]
             self._save_overrides()
-            # 重新加载 settings 来恢复默认值？或者需要更复杂的逻辑
-            # 简单处理：删除覆盖后，下次重启会恢复默认
+            self._restore_base_settings()
             return True
         return False
 
@@ -196,7 +215,4 @@ class ConfigService:
         """重置所有配置为默认值"""
         self._overrides = {}
         self._save_overrides()
-        # The same process (notably the Gradio worker) must immediately see
-        # environment defaults too; deleting the file alone leaves the old
-        # in-memory values in place.
-        self.settings = Settings.from_env()
+        self._restore_base_settings()
