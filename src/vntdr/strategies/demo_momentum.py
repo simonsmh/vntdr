@@ -7,6 +7,20 @@ from vntdr.models import BarRecord
 from vntdr.strategies.base import ReviewedStrategyBase
 
 
+DEFAULT_PARAMETERS = {
+    "lookback": 3,
+    "trade_mode": "both",
+}
+
+DEFAULT_PARAMETER_SPACE = {
+    "lookback": [2, 3, 4, 5],
+}
+
+DEFAULT_PARAMETER_BOUNDS = {
+    "lookback": "1~20",
+}
+
+
 class Strategy(ReviewedStrategyBase):
     """Simple reviewed momentum strategy used for tests and local validation."""
 

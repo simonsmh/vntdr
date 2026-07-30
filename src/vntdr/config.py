@@ -81,9 +81,11 @@ class ResearchSettings(BaseModel):
     spread_bps: float = Field(default=0.0, ge=0.0)
     funding_rate_per_bar: float = Field(default=0.0, ge=0.0)
     optimize_target: str = "sharpe"  # 寻优打分排序指标，可选: sharpe (夏普比率) / return (收益率)
-    trade_mode: str = "both"  # 交易模式，可选: both (多空双开) / long_only (只算多仓) / short_only (只算空仓)
     execution_mode: Literal["notify_only", "paper", "live"] = "notify_only"
     strategy_parameters: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    # Empty means no user override at the model level; ConfigService/webapp
+    # resolve it to all discovered built-in strategies for backwards compatibility.
+    enabled_strategies: list[str] | None = None
     monitored_targets: list[dict[str, Any]] = Field(default_factory=list)
 
 
@@ -164,7 +166,6 @@ class Settings(BaseModel):
                 spread_bps=float(mapping.get("VNTDR_SPREAD_BPS", "0")),
                 funding_rate_per_bar=float(mapping.get("VNTDR_FUNDING_RATE_PER_BAR", "0")),
                 optimize_target=mapping.get("VNTDR_OPTIMIZE_TARGET", "sharpe"),
-                trade_mode=mapping.get("VNTDR_TRADE_MODE", "both"),
                 execution_mode=mapping.get("VNTDR_EXECUTION_MODE", "notify_only").lower(),
             ),
             risk=RiskSettings(
@@ -188,6 +189,8 @@ class Settings(BaseModel):
             "backtest": self._validate_database,
             "optimize": self._validate_database,
             "walk-forward": self._validate_database,
+            "etf-flow-ingest": self._validate_database,
+            "etf-flow-scheduler": self._validate_database,
             "live": self._validate_live,
         }
         validator = validators.get(command_name)

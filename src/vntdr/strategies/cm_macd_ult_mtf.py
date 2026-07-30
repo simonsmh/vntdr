@@ -10,6 +10,7 @@ DEFAULT_PARAMETERS = {
     "slow_length": 21,
     "signal_length": 3,
     "trend_window": 7,
+    "trade_mode": "both",
 }
 
 DEFAULT_PARAMETER_SPACE = {
@@ -17,6 +18,13 @@ DEFAULT_PARAMETER_SPACE = {
     "slow_length": [10, 15, 20, 25, 30],
     "signal_length": [3, 5, 7, 9],
     "trend_window": [3, 5, 7, 9],
+}
+
+DEFAULT_PARAMETER_BOUNDS = {
+    "fast_length": "2~30",
+    "slow_length": "10~80",
+    "signal_length": "2~25",
+    "trend_window": "2~40",
 }
 
 

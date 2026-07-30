@@ -1,19 +1,39 @@
 from __future__ import annotations
 
-from datetime import datetime
-from typing import Any, Sequence
 import asyncio
+import math
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
+from datetime import date, datetime, timezone
+from typing import Any
 
 from sqlalchemy import select
 
 from vntdr.models import (
-    BarRecord, FactorObservation, FoldResult, Instrument, Interval, ResearchReport,
-    ShadowRun, StrategyActivation, StrategyInstance, StrategyVersion,
+    BarRecord,
+    FactorObservation,
+    FoldResult,
+    Instrument,
+    Interval,
+    ResearchReport,
+    ShadowRun,
+    StrategyActivation,
+    StrategyInstance,
+    StrategyVersion,
 )
 from vntdr.storage.database import (
-    BarORM, Database, FactorObservationORM, ResearchRunORM, StrategyActivationORM,
-    ShadowRunORM, StrategyInstanceORM, StrategyVersionORM, SyncJobORM, WalkForwardFoldORM,
+    BarORM,
+    Database,
+    EtfFlowIngestionRunORM,
+    EtfMoneyFlowDailyORM,
+    FactorObservationORM,
+    ResearchRunORM,
+    ShadowRunORM,
+    StrategyActivationORM,
+    StrategyInstanceORM,
+    StrategyVersionORM,
+    SyncJobORM,
+    WalkForwardFoldORM,
 )
 
 
@@ -185,6 +205,200 @@ class MarketDataRepository:
                 exchange=exchange,
             ),
         )
+
+
+class EtfMoneyFlowRepository:
+    """Idempotent persistence for normalized ETF money-flow rows and runs."""
+
+    def __init__(self, database: Database) -> None:
+        self.database = database
+
+    @staticmethod
+    def _finite(value: Any) -> float | None:
+        if value is None:
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        return number if math.isfinite(number) else None
+
+    @staticmethod
+    def _trade_date(value: Any) -> date:
+        if isinstance(value, datetime):
+            return value.date()
+        if isinstance(value, date):
+            return value
+        return date.fromisoformat(str(value))
+
+    def upsert_daily(
+        self,
+        frame: Any,
+        *,
+        market: str,
+        available_at: datetime,
+        fetched_at: datetime | None = None,
+        source: str = "akshare",
+        retry_count: int = 0,
+    ) -> int:
+        """Insert or update rows keyed by ``(symbol, trade_date)``."""
+        fetched_at = fetched_at or datetime.now(timezone.utc)
+        records = frame.to_dict("records") if hasattr(frame, "to_dict") else list(frame)
+        inserted = 0
+        with self.database.session() as session:
+            for record in records:
+                symbol = str(record["symbol"]).zfill(6)
+                trade_date = self._trade_date(record["trade_date"])
+                values = {
+                    "market": market,
+                    "main_net_inflow": self._finite(record.get("main_net_inflow")),
+                    "main_inflow_ratio": self._finite(record.get("main_inflow_ratio")),
+                    "extra_large_net_inflow": self._finite(
+                        record.get("extra_large_net_inflow")
+                    ),
+                    "large_net_inflow": self._finite(record.get("large_net_inflow")),
+                    "large_inflow_ratio": self._finite(record.get("large_inflow_ratio")),
+                    "calculated_main_net_inflow": self._finite(
+                        record.get("calculated_main_net_inflow")
+                    ),
+                    "main_component_gap": self._finite(record.get("main_component_gap")),
+                    "close_price": self._finite(record.get("close_price")),
+                    "pct_change": self._finite(record.get("pct_change")),
+                    "available_at": record.get("available_at") or available_at,
+                    "fetched_at": fetched_at,
+                    "source": source,
+                    "retry_count": int(retry_count),
+                }
+                row = session.scalar(
+                    select(EtfMoneyFlowDailyORM).where(
+                        EtfMoneyFlowDailyORM.symbol == symbol,
+                        EtfMoneyFlowDailyORM.trade_date == trade_date,
+                    )
+                )
+                if row is None:
+                    session.add(
+                        EtfMoneyFlowDailyORM(
+                            symbol=symbol,
+                            trade_date=trade_date,
+                            **values,
+                        )
+                    )
+                    inserted += 1
+                else:
+                    for key, value in values.items():
+                        setattr(row, key, value)
+        return inserted
+
+    def create_run(self, *, run_key: str, started_at: datetime, requested_count: int) -> int:
+        with self.database.session() as session:
+            row = EtfFlowIngestionRunORM(
+                run_key=run_key,
+                started_at=started_at,
+                requested_count=requested_count,
+            )
+            session.add(row)
+            session.flush()
+            return int(row.id)
+
+    def complete_run(
+        self,
+        run_id: int,
+        *,
+        status: str,
+        finished_at: datetime,
+        successful_count: int,
+        failed_count: int,
+        retry_count: int,
+        details: dict[str, Any],
+    ) -> None:
+        with self.database.session() as session:
+            row = session.get(EtfFlowIngestionRunORM, run_id)
+            if row is None:
+                raise ValueError(f"Unknown ETF flow ingestion run: {run_id}")
+            row.status = status
+            row.finished_at = finished_at
+            row.successful_count = successful_count
+            row.failed_count = failed_count
+            row.retry_count = retry_count
+            row.details = details
+
+    def count_daily(self, *, symbol: str | None = None) -> int:
+        with self.database.session() as session:
+            query = select(EtfMoneyFlowDailyORM)
+            if symbol is not None:
+                query = query.where(EtfMoneyFlowDailyORM.symbol == str(symbol).zfill(6))
+            return len(session.scalars(query).all())
+
+    def fetch_daily(
+        self,
+        *,
+        symbols: Sequence[str] | None = None,
+        start_date: date | None = None,
+        end_date: date | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return normalized ETF flow rows for dashboards and research views."""
+        with self.database.session() as session:
+            query = select(EtfMoneyFlowDailyORM)
+            if symbols:
+                normalized = [str(symbol).strip().zfill(6) for symbol in symbols]
+                query = query.where(EtfMoneyFlowDailyORM.symbol.in_(normalized))
+            if start_date is not None:
+                query = query.where(EtfMoneyFlowDailyORM.trade_date >= start_date)
+            if end_date is not None:
+                query = query.where(EtfMoneyFlowDailyORM.trade_date <= end_date)
+            query = query.order_by(
+                EtfMoneyFlowDailyORM.trade_date.desc(),
+                EtfMoneyFlowDailyORM.symbol.asc(),
+            )
+            if limit is not None:
+                query = query.limit(max(0, int(limit)))
+            rows = session.scalars(query).all()
+        return [
+            {
+                "symbol": row.symbol,
+                "market": row.market,
+                "trade_date": row.trade_date,
+                "main_net_inflow": row.main_net_inflow,
+                "main_inflow_ratio": row.main_inflow_ratio,
+                "extra_large_net_inflow": row.extra_large_net_inflow,
+                "large_net_inflow": row.large_net_inflow,
+                "large_inflow_ratio": row.large_inflow_ratio,
+                "calculated_main_net_inflow": row.calculated_main_net_inflow,
+                "main_component_gap": row.main_component_gap,
+                "close_price": row.close_price,
+                "pct_change": row.pct_change,
+                "available_at": row.available_at,
+                "fetched_at": row.fetched_at,
+                "source": row.source,
+                "retry_count": row.retry_count,
+            }
+            for row in rows
+        ]
+
+    def fetch_latest_runs(self, *, limit: int = 20) -> list[dict[str, Any]]:
+        """Return recent ingestion audit records for operational dashboards."""
+        with self.database.session() as session:
+            rows = session.scalars(
+                select(EtfFlowIngestionRunORM)
+                .order_by(EtfFlowIngestionRunORM.started_at.desc())
+                .limit(max(0, int(limit)))
+            ).all()
+        return [
+            {
+                "run_id": row.id,
+                "run_key": row.run_key,
+                "status": row.status,
+                "started_at": row.started_at,
+                "finished_at": row.finished_at,
+                "requested_count": row.requested_count,
+                "successful_count": row.successful_count,
+                "failed_count": row.failed_count,
+                "retry_count": row.retry_count,
+                "details": row.details or {},
+            }
+            for row in rows
+        ]
 
 
 class StrategyRepository:

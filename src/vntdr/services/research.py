@@ -18,6 +18,7 @@ from vntdr.storage.repositories import MarketDataRepository, ResearchRunReposito
 from vntdr.storage.repositories import StrategyRepository
 
 EXACT_SEARCH_COMBINATION_LIMIT = 10_000
+VALID_TRADE_MODES = frozenset({"both", "long_only", "short_only"})
 
 
 @dataclass
@@ -165,6 +166,7 @@ class ResearchService:
             bars=bars,
             strategy_name=config.strategy_name,
             parameter_space=config.parameter_space,
+            base_parameters=config.parameters,
             method=method,
             optimize_target=config.optimize_target,
             data_context=context,
@@ -225,6 +227,7 @@ class ResearchService:
                 bars=train_bars,
                 strategy_name=config.strategy_name,
                 parameter_space=config.parameter_space,
+                base_parameters=config.parameters,
                 method=config.method,
                 optimize_target=config.optimize_target,
                 data_context=context,
@@ -398,6 +401,26 @@ class ResearchService:
         strategy = self._load_strategy(strategy_name)
         return dict(getattr(strategy, "DEFAULT_PARAMETER_SPACE", {}))
 
+    def _merged_strategy_parameters(
+        self, strategy_name: str, parameters: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Resolve one strategy's complete, versionable parameter set."""
+        return {**self.default_parameters(strategy_name), **parameters}
+
+    @staticmethod
+    def _filter_signal_by_trade_mode(signal: int, parameters: dict[str, Any]) -> int:
+        mode = str(parameters.get("trade_mode", "both")).strip().lower()
+        if mode not in VALID_TRADE_MODES:
+            raise ValueError(
+                f"Invalid trade_mode {mode!r}; expected one of "
+                f"{sorted(VALID_TRADE_MODES)}"
+            )
+        if mode == "long_only" and signal < 0:
+            return 0
+        if mode == "short_only" and signal > 0:
+            return 0
+        return signal
+
     def optimize_parameters(
         self,
         *,
@@ -413,6 +436,7 @@ class ResearchService:
             bars=bars,
             strategy_name=strategy_name,
             parameter_space=parameter_space,
+            base_parameters=None,
             method=method,
             optimize_target=optimize_target,
         )
@@ -450,6 +474,7 @@ class ResearchService:
         strategy = self._load_strategy(strategy_name)
         if not bars:
             return 0
+        parameters = self._merged_strategy_parameters(strategy_name, parameters)
         if hasattr(strategy, "target_position_for_context") and data_context is not None:
             sig = int(strategy.target_position_for_context(
                 bars, len(bars) - 1, parameters, current_position, data_context
@@ -462,12 +487,7 @@ class ResearchService:
             )
         else:
             sig = int(strategy.signal_for_index(bars, len(bars) - 1, parameters))
-        trade_mode = getattr(self.settings.research, "trade_mode", "both")
-        if trade_mode == "long_only" and sig < 0:
-            return 0
-        if trade_mode == "short_only" and sig > 0:
-            return 0
-        return sig
+        return self._filter_signal_by_trade_mode(sig, parameters)
 
     async def latest_signal_async(
         self,
@@ -498,6 +518,7 @@ class ResearchService:
         bars: list[BarRecord],
         strategy_name: str,
         parameter_space: dict[str, list[Any]],
+        base_parameters: dict[str, Any] | None = None,
         method: str = "ga",
         optimize_target: str = "sharpe",
         data_context: MarketDataContext | None = None,
@@ -519,11 +540,20 @@ class ResearchService:
             m = "grid"
 
         if m == "grid":
-            return self._run_grid_search(bars, strategy_name, parameter_space, optimize_target, data_context)
+            return self._run_grid_search(
+                bars, strategy_name, parameter_space, optimize_target,
+                data_context, base_parameters,
+            )
         elif m in ("heuristic", "bfs", "astar"):
-            return self._run_heuristic_search(bars, strategy_name, parameter_space, optimize_target, data_context=data_context)
+            return self._run_heuristic_search(
+                bars, strategy_name, parameter_space, optimize_target,
+                data_context=data_context, base_parameters=base_parameters,
+            )
         else:
-            return self._run_genetic_search(bars, strategy_name, parameter_space, optimize_target, data_context=data_context)
+            return self._run_genetic_search(
+                bars, strategy_name, parameter_space, optimize_target,
+                data_context=data_context, base_parameters=base_parameters,
+            )
 
     def _run_grid_search(
         self,
@@ -532,6 +562,7 @@ class ResearchService:
         parameter_space: dict[str, list[Any]],
         optimize_target: str = "sharpe",
         data_context: MarketDataContext | None = None,
+        base_parameters: dict[str, Any] | None = None,
     ) -> list[tuple[dict[str, Any], dict[str, float]]]:
         keys = list(parameter_space.keys())
         value_lists = [parameter_space[k] for k in keys]
@@ -540,8 +571,11 @@ class ResearchService:
         evaluations = []
         for combo in combinations:
             params = dict(zip(keys, combo, strict=True))
-            outcome = self._execute_with_context(bars, strategy_name, params, data_context)
-            evaluations.append((params, outcome.metrics))
+            effective_parameters = {**(base_parameters or {}), **params}
+            outcome = self._execute_with_context(
+                bars, strategy_name, effective_parameters, data_context
+            )
+            evaluations.append((effective_parameters, outcome.metrics))
             
         return self._sort_evaluations(evaluations, optimize_target)
 
@@ -553,6 +587,7 @@ class ResearchService:
         optimize_target: str = "sharpe",
         max_evaluations: int = 100,
         data_context: MarketDataContext | None = None,
+        base_parameters: dict[str, Any] | None = None,
     ) -> list[tuple[dict[str, Any], dict[str, float]]]:
         """A*-inspired Heuristic graph search over parameter grid."""
         import heapq
@@ -562,7 +597,10 @@ class ResearchService:
         dim_lengths = [len(parameter_space[k]) for k in keys]
         
         def node_to_params(node: tuple[int, ...]) -> dict[str, Any]:
-            return {keys[i]: parameter_space[keys[i]][node[i]] for i in range(len(keys))}
+            return {
+                **(base_parameters or {}),
+                **{keys[i]: parameter_space[keys[i]][node[i]] for i in range(len(keys))},
+            }
             
         evaluations: dict[tuple[int, ...], tuple[dict[str, Any], dict[str, float]]] = {}
         
@@ -635,6 +673,7 @@ class ResearchService:
         parameter_space: dict[str, list[Any]],
         optimize_target: str = "sharpe",
         data_context: MarketDataContext | None = None,
+        base_parameters: dict[str, Any] | None = None,
     ) -> list[tuple[dict[str, Any], dict[str, float]]]:
         # Use a local Random instance with a fixed seed for 100% reproducibility
         local_random = random.Random(42)
@@ -652,8 +691,11 @@ class ResearchService:
             for parameters in population:
                 signature = json.dumps(parameters, sort_keys=True)
                 if signature not in evaluations:
-                    outcome = self._execute_with_context(bars, strategy_name, parameters, data_context)
-                    evaluations[signature] = (parameters.copy(), outcome.metrics)
+                    effective_parameters = {**(base_parameters or {}), **parameters}
+                    outcome = self._execute_with_context(
+                        bars, strategy_name, effective_parameters, data_context
+                    )
+                    evaluations[signature] = (effective_parameters, outcome.metrics)
                 scored.append(evaluations[signature])
             # Sort by target primarily, penalizing zero trades to avoid passive dominance
             scored = self._sort_evaluations(scored, optimize_target)
@@ -724,6 +766,10 @@ class ResearchService:
             # Tests and third-party in-memory strategy doubles have no module.
             pass
         parameters = {**strategy_defaults, **parameters}
+        # Direction selection belongs to this strategy parameter set.  It is
+        # deliberately resolved before execution governance so a disallowed
+        # reversal is treated as a close/flat signal, not as another strategy
+        # direction hidden by a global setting.
         position = 0
         position_exposure = 1.0
         equity = [1.0]
@@ -779,6 +825,8 @@ class ResearchService:
             else:
                 signal = int(strategy.signal_for_index(bars, index, parameters))
 
+            signal = self._filter_signal_by_trade_mode(signal, parameters)
+
             # Generic execution governance is parameterised on the strategy
             # version so every plugin can opt in without duplicating stateful
             # fill logic. A reversal first closes the position, then observes
@@ -794,13 +842,6 @@ class ResearchService:
                     signal = 0
                     cooldown_until_index = index + 1 + cooldown_bars
             
-            # Apply trade mode filtering
-            trade_mode = getattr(self.settings.research, "trade_mode", "both")
-            if trade_mode == "long_only" and signal < 0:
-                signal = 0
-            elif trade_mode == "short_only" and signal > 0:
-                signal = 0
-                
             signals.append(signal)
 
             fill_bar = bars[index + 1]

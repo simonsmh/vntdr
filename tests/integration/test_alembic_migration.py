@@ -16,4 +16,11 @@ def test_alembic_upgrade_creates_strategy_platform_tables(tmp_path) -> None:
     )
     assert result.returncode == 0, result.stderr
     tables = set(inspect(create_engine(db_url)).get_table_names())
-    assert {"strategy_versions", "strategy_instances", "strategy_activations", "factor_observations"} <= tables
+    assert {
+        "strategy_versions",
+        "strategy_instances",
+        "strategy_activations",
+        "factor_observations",
+        "etf_money_flow_daily",
+        "etf_flow_ingestion_runs",
+    } <= tables

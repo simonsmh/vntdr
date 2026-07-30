@@ -13,6 +13,7 @@ class ConfigService:
     # 配置项中文名称映射
     CONFIG_LABELS = {
         "research.default_strategy": "📊 默认策略",
+        "research.enabled_strategies": "🧩 启用的策略",
         "research.default_symbol": "💰 默认交易对",
         "research.default_interval": "⏱️ 默认周期",
         "research.default_order_size": "📦 默认下单量",
@@ -24,7 +25,6 @@ class ConfigService:
         "research.spread_bps": "↔️ 买卖价差（基点）",
         "research.funding_rate_per_bar": "💱 每根K线资金费率",
         "research.optimize_target": "🎯 寻优打分排序指标",
-        "research.trade_mode": "🔄 交易模式 (多空/仅多/仅空)",
         "research.execution_mode": "🚦 执行模式 (仅通知/模拟/实盘)",
         "risk.max_strategy_capital": "🛡️ 单策略最大资金",
         "risk.max_total_exposure": "🛡️ 最大总敞口",
@@ -154,6 +154,7 @@ class ConfigService:
         # Research 配置
         for key in [
             "default_strategy",
+            "enabled_strategies",
             "default_symbol",
             "default_interval",
             "default_order_size",
@@ -165,7 +166,6 @@ class ConfigService:
             "spread_bps",
             "funding_rate_per_bar",
             "optimize_target",
-            "trade_mode",
             "execution_mode",
         ]:
             result[f"research.{key}"] = getattr(self.settings.research, key)

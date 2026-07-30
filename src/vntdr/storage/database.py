@@ -1,10 +1,21 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import datetime
-from typing import Iterator
+from datetime import date, datetime
 
-from sqlalchemy import JSON, Boolean, DateTime, Float, Integer, String, UniqueConstraint, create_engine, text
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    Date,
+    DateTime,
+    Float,
+    Integer,
+    String,
+    UniqueConstraint,
+    create_engine,
+    text,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 
@@ -143,6 +154,50 @@ class FactorObservationORM(Base):
     available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     interval: Mapped[str | None] = mapped_column(String(16), nullable=True)
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class EtfMoneyFlowDailyORM(Base):
+    """Normalized daily ETF money-flow observations from the research source."""
+
+    __tablename__ = "etf_money_flow_daily"
+    __table_args__ = (
+        UniqueConstraint("symbol", "trade_date", name="uq_etf_money_flow_daily"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    symbol: Mapped[str] = mapped_column(String(16), index=True)
+    market: Mapped[str] = mapped_column(String(8))
+    trade_date: Mapped[date] = mapped_column(Date, index=True)
+    main_net_inflow: Mapped[float | None] = mapped_column(Float, nullable=True)
+    main_inflow_ratio: Mapped[float | None] = mapped_column(Float, nullable=True)
+    extra_large_net_inflow: Mapped[float | None] = mapped_column(Float, nullable=True)
+    large_net_inflow: Mapped[float | None] = mapped_column(Float, nullable=True)
+    large_inflow_ratio: Mapped[float | None] = mapped_column(Float, nullable=True)
+    calculated_main_net_inflow: Mapped[float | None] = mapped_column(Float, nullable=True)
+    main_component_gap: Mapped[float | None] = mapped_column(Float, nullable=True)
+    close_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    pct_change: Mapped[float | None] = mapped_column(Float, nullable=True)
+    available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    source: Mapped[str] = mapped_column(String(32), default="akshare")
+    retry_count: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class EtfFlowIngestionRunORM(Base):
+    """Audit record for one scheduled ETF-flow ingestion run."""
+
+    __tablename__ = "etf_flow_ingestion_runs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    run_key: Mapped[str] = mapped_column(String(96), unique=True, index=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    status: Mapped[str] = mapped_column(String(16), default="started")
+    requested_count: Mapped[int] = mapped_column(Integer, default=0)
+    successful_count: Mapped[int] = mapped_column(Integer, default=0)
+    failed_count: Mapped[int] = mapped_column(Integer, default=0)
+    retry_count: Mapped[int] = mapped_column(Integer, default=0)
+    details: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
 class Database:

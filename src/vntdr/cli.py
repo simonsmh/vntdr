@@ -5,7 +5,8 @@ import json
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import date, datetime
+from pathlib import Path
 from typing import Any
 from uuid import UUID
 
@@ -24,6 +25,18 @@ from vntdr.services.history import HistorySyncService, OkxHistoryClient
 from vntdr.services.tradingview_history import TradingViewHistoryClient
 from vntdr.services.external_factors import OkxDerivativesProvider
 from vntdr.services.factor_sync import FactorSyncService
+from vntdr.services.akshare_fund_flow import (
+    AkShareDataError,
+    AkShareFlowConfig,
+    AkShareFundFlowProvider,
+    AkShareUnavailableError,
+    month_bounds,
+)
+from vntdr.services.etf_flow_ingestion import (
+    EtfFlowIngestionService,
+    parse_watchlist,
+)
+from vntdr.services.etf_flow_scheduler import EtfFlowScheduler
 from vntdr.services.governance import StrategyGovernanceService
 from vntdr.services.monitoring import MonitoringService
 from vntdr.services.portfolio_runtime import PortfolioRuntimeService
@@ -32,7 +45,12 @@ from vntdr.services.risk import RiskManager
 from vntdr.services.strategy_runtime import StrategyRuntimeService
 from vntdr.services.telegram_research import TelegramResearchService
 from vntdr.storage.database import Database
-from vntdr.storage.repositories import MarketDataRepository, ResearchRunRepository, StrategyRepository
+from vntdr.storage.repositories import (
+    EtfMoneyFlowRepository,
+    MarketDataRepository,
+    ResearchRunRepository,
+    StrategyRepository,
+)
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
 
@@ -576,6 +594,255 @@ def sync_okx_derivatives_command(
         end=datetime.fromisoformat(end),
     )
     typer.echo(f"OKX derivative factors synced: {count} observations for {symbol}")
+
+
+@app.command("akshare-csi300-flow")
+def akshare_csi300_flow_command(
+    symbol: str | None = typer.Option(
+        None, help="单标的验证，例如 515180；设置后不抓取沪深300"
+    ),
+    market: str = typer.Option("sh", help="单标的市场：sh、sz 或 bj"),
+    start: str | None = typer.Option(None, "--from", help="开始日期 YYYY-MM-DD，默认本月1日"),
+    end: str | None = typer.Option(None, "--to", help="结束日期 YYYY-MM-DD，默认今天"),
+    max_stocks: int | None = typer.Option(
+        None, min=1, help="最多抓取多少只成分股；MVP 小额验证可设为 10"
+    ),
+    output_dir: Path | None = typer.Option(
+        None, help="结果目录，默认 VNTDR_REPORT_DIR 或 reports"
+    ),
+    request_interval: float = typer.Option(
+        0.8, min=0.0, help="个股请求之间的等待秒数，避免公开接口限流"
+    ),
+    max_retries: int = typer.Option(3, min=0, help="单只股票失败后的重试次数"),
+    retry_backoff_seconds: float = typer.Option(
+        1.0, min=0.0, help="重试初始退避秒数，之后按 2 倍递增"
+    ),
+    retry_jitter_seconds: float = typer.Option(
+        0.25, min=0.0, help="重试退避的随机抖动秒数，避免请求同时重试"
+    ),
+) -> None:
+    """用 AkShare 拉取沪深300本月个股主力/大单资金流趋势。"""
+    settings = Settings.from_env()
+    default_start, default_end = month_bounds()
+    try:
+        start_date = date.fromisoformat(start) if start else default_start
+        end_date = date.fromisoformat(end) if end else default_end
+    except ValueError as exc:
+        raise typer.BadParameter("日期必须是 YYYY-MM-DD") from exc
+    if start_date > end_date:
+        raise typer.BadParameter("开始日期不能晚于结束日期")
+
+    provider = AkShareFundFlowProvider(
+        config=AkShareFlowConfig(
+            request_interval_seconds=request_interval,
+            max_retries=max_retries,
+            retry_backoff_seconds=retry_backoff_seconds,
+            retry_jitter_seconds=retry_jitter_seconds,
+        )
+    )
+    try:
+        if symbol:
+            daily, stock, summary = provider.fetch_symbol(
+                symbol=symbol,
+                market=market,
+                start_date=start_date,
+                end_date=end_date,
+            )
+        else:
+            daily, stock, summary = provider.fetch_month(
+                start_date=start_date,
+                end_date=end_date,
+                max_stocks=max_stocks,
+            )
+    except (AkShareDataError, AkShareUnavailableError) as exc:
+        typer.echo(f"AkShare 数据获取失败：{exc}", err=True)
+        raise typer.Exit(code=2) from exc
+
+    destination = output_dir or settings.research.report_dir
+    destination.mkdir(parents=True, exist_ok=True)
+    scope = str(symbol).zfill(6) if symbol else "csi300"
+    slug = f"akshare_{scope}_flow_{start_date.isoformat()}_{end_date.isoformat()}"
+    daily_path = destination / f"{slug}_daily.csv"
+    stock_path = destination / f"{slug}_stocks.csv"
+    summary_path = destination / f"{slug}_summary.json"
+    daily.to_csv(daily_path, index=False)
+    stock.to_csv(stock_path, index=False)
+    summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+
+    typer.echo(json.dumps(summary, ensure_ascii=False, indent=2, default=str))
+    typer.echo(f"daily_csv={daily_path}")
+    typer.echo(f"stocks_csv={stock_path}")
+    typer.echo(f"summary_json={summary_path}")
+    if not stock.empty:
+        columns = [
+            "symbol", "main_net_inflow_sum", "large_net_inflow_sum",
+            "main_positive_ratio", "latest_main_net_inflow",
+        ]
+        typer.echo("top_stocks=")
+        typer.echo(stock.loc[:, [column for column in columns if column in stock]].head(10).to_csv(index=False))
+
+
+def _build_etf_flow_ingestion_service(
+    settings: Settings,
+    *,
+    symbols: str | None,
+    lookback_days: int,
+    request_interval: float,
+    max_retries: int,
+    retry_backoff_seconds: float,
+    retry_jitter_seconds: float,
+    timezone_name: str = "Asia/Shanghai",
+    availability_hour: int = 16,
+    availability_minute: int = 10,
+) -> EtfFlowIngestionService:
+    raw_watchlist = symbols or os.getenv("VNTDR_ETF_WATCHLIST")
+    watchlist = parse_watchlist(raw_watchlist)
+    database = Database(settings.database.dsn)
+    database.create_schema()
+    provider = AkShareFundFlowProvider(
+        config=AkShareFlowConfig(
+            request_interval_seconds=request_interval,
+            max_retries=max_retries,
+            retry_backoff_seconds=retry_backoff_seconds,
+            retry_jitter_seconds=retry_jitter_seconds,
+        )
+    )
+    return EtfFlowIngestionService(
+        provider=provider,
+        repository=EtfMoneyFlowRepository(database),
+        watchlist=watchlist,
+        lookback_days=lookback_days,
+        timezone_name=timezone_name,
+        availability_hour=availability_hour,
+        availability_minute=availability_minute,
+    )
+
+
+def _parse_optional_date(value: str | None, *, label: str) -> date | None:
+    if value is None:
+        return None
+    try:
+        return date.fromisoformat(value)
+    except ValueError as exc:
+        raise typer.BadParameter(f"{label}必须是 YYYY-MM-DD") from exc
+
+
+@app.command("etf-flow-ingest")
+def etf_flow_ingest_command(
+    symbols: str | None = typer.Option(
+        None,
+        help=(
+            "观察池，格式 symbol:market,symbol:market；默认使用指定的 7 只 ETF，"
+            "也可用 VNTDR_ETF_WATCHLIST 覆盖"
+        ),
+    ),
+    start: str | None = typer.Option(None, "--from", help="开始日期 YYYY-MM-DD"),
+    end: str | None = typer.Option(None, "--to", help="结束日期 YYYY-MM-DD，默认今天"),
+    lookback_days: int = typer.Option(120, min=1, help="未指定开始日期时回溯的自然日天数"),
+    output_dir: Path | None = typer.Option(None, help="摘要目录，默认 VNTDR_REPORT_DIR 或 reports"),
+    request_interval: float = typer.Option(
+        0.8, min=0.0, help="个股请求之间的等待秒数，避免公开接口限流"
+    ),
+    max_retries: int = typer.Option(3, min=0, help="单只 ETF 失败后的重试次数"),
+    retry_backoff_seconds: float = typer.Option(
+        1.0, min=0.0, help="重试初始退避秒数，之后按 2 倍递增"
+    ),
+    retry_jitter_seconds: float = typer.Option(
+        0.25, min=0.0, help="重试退避的随机抖动秒数"
+    ),
+) -> None:
+    """一次性拉取 ETF 观察池资金流并幂等写入 PostgreSQL。"""
+    settings = Settings.from_env()
+    settings.validate_for("etf-flow-ingest")
+    start_date = _parse_optional_date(start, label="开始日期")
+    end_date = _parse_optional_date(end, label="结束日期")
+    if start_date and end_date and start_date > end_date:
+        raise typer.BadParameter("开始日期不能晚于结束日期")
+    try:
+        service = _build_etf_flow_ingestion_service(
+            settings,
+            symbols=symbols,
+            lookback_days=lookback_days,
+            request_interval=request_interval,
+            max_retries=max_retries,
+            retry_backoff_seconds=retry_backoff_seconds,
+            retry_jitter_seconds=retry_jitter_seconds,
+        )
+        result = service.run(start_date=start_date, end_date=end_date)
+    except (AkShareDataError, AkShareUnavailableError, ValueError) as exc:
+        typer.echo(f"ETF 资金流采集失败：{exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    destination = output_dir or settings.research.report_dir
+    destination.mkdir(parents=True, exist_ok=True)
+    summary_path = destination / f"etf_flow_ingest_{result['date_end']}.json"
+    summary_path.write_text(
+        json.dumps(result, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
+    )
+    typer.echo(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+    typer.echo(f"summary_json={summary_path}")
+    if result.get("retryable", False):
+        raise typer.Exit(code=1)
+
+
+@app.command("etf-flow-scheduler")
+def etf_flow_scheduler_command(
+    run_once: bool = typer.Option(False, help="立即执行一次后退出，不启动常驻调度"),
+    symbols: str | None = typer.Option(None, help="观察池，格式 symbol:market,symbol:market"),
+    hour: int = typer.Option(16, min=0, max=23, help="每日触发小时（Asia/Shanghai）"),
+    minute: int = typer.Option(10, min=0, max=59, help="每日触发分钟（Asia/Shanghai）"),
+    timezone_name: str = typer.Option("Asia/Shanghai", help="调度时区"),
+    lookback_days: int = typer.Option(120, min=1),
+    request_interval: float = typer.Option(0.8, min=0.0),
+    max_retries: int = typer.Option(3, min=0),
+    retry_backoff_seconds: float = typer.Option(1.0, min=0.0),
+    retry_jitter_seconds: float = typer.Option(0.25, min=0.0),
+    retry_until_success: bool = typer.Option(
+        True,
+        "--retry-until-success/--no-retry-until-success",
+        help="任务失败后持续延迟重试，直到整批成功",
+    ),
+    task_retry_base_seconds: float = typer.Option(
+        60.0, min=1.0, help="任务级重试的初始等待秒数"
+    ),
+    task_retry_max_seconds: float = typer.Option(
+        1800.0, min=1.0, help="任务级重试的最大等待秒数"
+    ),
+) -> None:
+    """使用 APScheduler 在交易日收盘后持续采集 ETF 资金流。"""
+    settings = Settings.from_env()
+    settings.validate_for("etf-flow-scheduler")
+    try:
+        service = _build_etf_flow_ingestion_service(
+            settings,
+            symbols=symbols,
+            lookback_days=lookback_days,
+            request_interval=request_interval,
+            max_retries=max_retries,
+            retry_backoff_seconds=retry_backoff_seconds,
+            retry_jitter_seconds=retry_jitter_seconds,
+            timezone_name=timezone_name,
+            availability_hour=hour,
+            availability_minute=minute,
+        )
+        scheduler = EtfFlowScheduler(
+            ingestion_service=service,
+            timezone_name=timezone_name,
+            hour=hour,
+            minute=minute,
+            retry_until_success=retry_until_success,
+            task_retry_base_seconds=task_retry_base_seconds,
+            task_retry_max_seconds=task_retry_max_seconds,
+        )
+        if run_once:
+            result = scheduler.run_once()
+            typer.echo(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+            if result.get("retryable", False):
+                raise typer.Exit(code=1)
+            return
+        scheduler.start()
+    except (AkShareDataError, AkShareUnavailableError, ValueError) as exc:
+        typer.echo(f"ETF 资金流调度失败：{exc}", err=True)
+        raise typer.Exit(code=2) from exc
 
 
 def _build_research_config(

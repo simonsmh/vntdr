@@ -14,6 +14,7 @@ from vntdr.services.data_context import MarketDataContext
 from vntdr.strategies.base import ReviewedStrategyBase
 
 DEFAULT_PARAMETERS = {
+    "trade_mode": "both",
     "trend_window": 50,
     "breakout_window": 20,
     "regime_window": 20,
@@ -48,6 +49,28 @@ DEFAULT_PARAMETER_SPACE = {
     "max_atr_ratio": [0.03, 0.04],
     "entry_threshold": [0.55, 0.65],
     "exit_threshold": [0.15, 0.25],
+}
+
+DEFAULT_PARAMETER_BOUNDS = {
+    "trend_window": "20~100:10",
+    "breakout_window": "10~40:5",
+    "regime_window": "10~40:5",
+    "min_efficiency": "0.05~0.4:0.05",
+    "max_atr_ratio": "0.01~0.08:0.01",
+    "entry_threshold": "0.4~0.8:0.1",
+    "exit_threshold": "0.05~0.4:0.05",
+    "trend_weight": "0~1:0.25",
+    "momentum_weight": "0~1:0.25",
+    "daily_trend_weight": "0~0.5:0.25",
+    "funding_weight": "0~0.5:0.25",
+    "open_interest_weight": "0~0.5:0.25",
+    "funding_rate_scale": "0.0005~0.003:0.0005",
+    "open_interest_change_scale": "0.02~0.15:0.01",
+    "min_holding_bars": "1~10",
+    "cooldown_bars": "0~10",
+    "risk_fraction": "0.0025~0.02:0.0025",
+    "stop_atr_multiple": "1~4:0.5",
+    "max_notional_fraction": "0.1~0.5:0.1",
 }
 
 

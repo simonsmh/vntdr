@@ -78,6 +78,28 @@ services:
     networks:
       - quant_net
 
+  etf_ingest:
+    image: ghcr.io/simonsmh/vntdr:latest
+    restart: always
+    environment:
+      PG_HOST: ${PG_HOST:-db}
+      PG_PORT: ${PG_PORT:-5432}
+      PG_USER: ${PG_USER:-vntdr}
+      PG_PASSWORD: ${PG_PASSWORD:-changeme}
+      PG_DB_NAME: ${PG_DB_NAME:-vntdr}
+      VNTDR_ETF_WATCHLIST: ${VNTDR_ETF_WATCHLIST:-588200:sh,510300:sh,588170:sh,588080:sh,159845:sz,159941:sz,512400:sh}
+      VNTDR_RUN_MIGRATIONS: "false"
+    depends_on:
+      db:
+        condition: service_healthy
+      quant_core:
+        condition: service_healthy
+    command: ["vntdr", "etf-flow-scheduler"]
+    volumes:
+      - reports_data:/app/reports
+    networks:
+      - quant_net
+
   webapp:
     image: ghcr.io/simonsmh/vntdr:latest
     restart: always
@@ -100,6 +122,7 @@ services:
       REDIS_MAXMEMORY_POLICY: ${REDIS_MAXMEMORY_POLICY:-allkeys-lru}
       TG_BOT_TOKEN: ${TG_BOT_TOKEN:-}
       TG_CHAT_ID: ${TG_CHAT_ID:-}
+      VNTDR_ETF_WATCHLIST: ${VNTDR_ETF_WATCHLIST:-588200:sh,510300:sh,588170:sh,588080:sh,159845:sz,159941:sz,512400:sh}
       VNTDR_RUN_MIGRATIONS: "false"
       GRADIO_PORT: ${GRADIO_CONTAINER_PORT:-7860}
     depends_on:

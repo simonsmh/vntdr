@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import gradio as gr
 import pandas as pd
@@ -13,14 +15,24 @@ from plotly.subplots import make_subplots
 
 from vntdr.config import Settings
 from vntdr.models import ResearchJobConfig
+from vntdr.services.akshare_fund_flow import AkShareFlowConfig, AkShareFundFlowProvider
 from vntdr.services.config_service import ConfigService
 from vntdr.services.data_quality import assess_bars
-from vntdr.services.history import OkxHistoryClient, HistorySyncService
+from vntdr.services.etf_flow_ingestion import (
+    DEFAULT_ETF_WATCHLIST,
+    EtfFlowIngestionService,
+    parse_watchlist,
+)
+from vntdr.services.history import HistorySyncService, OkxHistoryClient
 from vntdr.services.research import ResearchService
 from vntdr.services.tradingview_history import TradingViewHistoryClient
 from vntdr.storage.database import Database
-from vntdr.storage.repositories import MarketDataRepository, ResearchRunRepository, StrategyRepository
-
+from vntdr.storage.repositories import (
+    EtfMoneyFlowRepository,
+    MarketDataRepository,
+    ResearchRunRepository,
+    StrategyRepository,
+)
 
 # ── 工具函数 ──────────────────────────────────────────────────────────
 
@@ -188,12 +200,15 @@ PARAM_LABELS = {
 
 STRATEGY_PARAMS: dict[str, dict[str, Any]] = {
     "demo_momentum": {
-        "defaults": {"lookback": 3},
+        "defaults": {"lookback": 3, "trade_mode": "both"},
         "space": {"lookback": "2~5"},
         "bounds": {"lookback": "1~20"},
     },
     "cm_macd_ult_mtf": {
-        "defaults": {"fast_length": 6, "slow_length": 21, "signal_length": 3, "trend_window": 7},
+        "defaults": {
+            "fast_length": 6, "slow_length": 21, "signal_length": 3,
+            "trend_window": 7, "trade_mode": "both",
+        },
         "space": {
             "fast_length":   "2~12:2",
             "slow_length":   "10~30:5",
@@ -209,6 +224,7 @@ STRATEGY_PARAMS: dict[str, dict[str, Any]] = {
     },
     "multi_factor": {
         "defaults": {
+            "trade_mode": "both",
             "trend_window": 50, "breakout_window": 20, "regime_window": 20,
             "min_efficiency": 0.15, "atr_window": 14, "max_atr_ratio": 0.04,
             "entry_threshold": 0.6, "exit_threshold": 0.2,
@@ -342,6 +358,210 @@ def _get_config_service():
         settings = Settings.from_env()
         _CONFIG_SERVICE = ConfigService(settings)
     return _CONFIG_SERVICE
+
+
+# ── ETF 资金流面板 ───────────────────────────────────────────────────
+
+_ETF_ZONE = ZoneInfo("Asia/Shanghai")
+
+
+def _etf_default_watchlist_text() -> str:
+    configured = os.getenv("VNTDR_ETF_WATCHLIST")
+    if configured:
+        return configured
+    return ",".join(f"{target.symbol}:{target.market}" for target in DEFAULT_ETF_WATCHLIST)
+
+
+def _etf_repository() -> EtfMoneyFlowRepository:
+    settings = _get_config_service().settings
+    database = Database(settings.database.dsn)
+    # The panel can be opened on a fresh MVP deployment before Alembic runs.
+    database.create_schema()
+    return EtfMoneyFlowRepository(database)
+
+
+def _etf_today() -> date:
+    return datetime.now(timezone.utc).astimezone(_ETF_ZONE).date()
+
+
+def _format_etf_timestamp(value: Any) -> str:
+    if value is None:
+        return "-"
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(_ETF_ZONE).strftime("%Y-%m-%d %H:%M")
+    return str(value)
+
+
+def _etf_display_frames(
+    rows: list[dict[str, Any]],
+    runs: list[dict[str, Any]],
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, go.Figure]:
+    columns = [
+        "标的", "市场", "观测天数", "主力累计净流入", "主力正流入天数",
+        "主力正流入占比", "最新主力净流入", "最新主力净流入率", "最新收盘价",
+        "最新涨跌幅", "最后交易日",
+    ]
+    daily_columns = [
+        "交易日", "标的", "市场", "主力净流入", "主力净流入率", "超大单净流入",
+        "大单净流入", "大单净流入率", "收盘价", "涨跌幅", "可用时间", "抓取时间", "重试次数",
+    ]
+    run_columns = [
+        "运行 ID", "状态", "开始时间", "结束时间", "请求数", "成功数", "失败数", "重试次数", "详情",
+    ]
+    if not rows:
+        empty = pd.DataFrame(columns=daily_columns)
+        run_rows = [
+            [
+                run.get("run_id"), run.get("status", ""),
+                _format_etf_timestamp(run.get("started_at")),
+                _format_etf_timestamp(run.get("finished_at")),
+                run.get("requested_count", 0), run.get("successful_count", 0),
+                run.get("failed_count", 0), run.get("retry_count", 0),
+                json.dumps(run.get("details") or {}, ensure_ascii=False, default=str),
+            ]
+            for run in runs
+        ]
+        return pd.DataFrame(columns=columns), empty, pd.DataFrame(run_rows, columns=run_columns), go.Figure()
+
+    raw = pd.DataFrame(rows)
+    raw["trade_date"] = pd.to_datetime(raw["trade_date"], errors="coerce")
+    raw = raw.dropna(subset=["trade_date"]).sort_values(["symbol", "trade_date"])
+    summary_rows: list[list[Any]] = []
+    for symbol, group in raw.groupby("symbol", sort=True):
+        latest = group.iloc[-1]
+        main = pd.to_numeric(group["main_net_inflow"], errors="coerce")
+        positive_days = int((main > 0).sum())
+        observation_days = int(main.notna().sum())
+        summary_rows.append([
+            symbol,
+            str(latest.get("market", "")),
+            observation_days,
+            float(main.sum()),
+            positive_days,
+            positive_days / observation_days if observation_days else None,
+            latest.get("main_net_inflow"),
+            latest.get("main_inflow_ratio"),
+            latest.get("close_price"),
+            latest.get("pct_change"),
+            latest["trade_date"].date(),
+        ])
+    summary = pd.DataFrame(summary_rows, columns=columns).sort_values(
+        "主力累计净流入", ascending=False
+    )
+    summary["主力累计净流入"] = summary["主力累计净流入"].round(2)
+    summary["主力正流入占比"] = summary["主力正流入占比"].round(4)
+    for column in ("最新主力净流入", "最新主力净流入率", "最新收盘价", "最新涨跌幅"):
+        summary[column] = pd.to_numeric(summary[column], errors="coerce").round(4)
+
+    daily = raw.rename(columns={
+        "trade_date": "交易日", "symbol": "标的", "market": "市场",
+        "main_net_inflow": "主力净流入", "main_inflow_ratio": "主力净流入率",
+        "extra_large_net_inflow": "超大单净流入", "large_net_inflow": "大单净流入",
+        "large_inflow_ratio": "大单净流入率", "close_price": "收盘价", "pct_change": "涨跌幅",
+        "available_at": "可用时间", "fetched_at": "抓取时间", "retry_count": "重试次数",
+    })
+    daily["交易日"] = daily["交易日"].dt.date
+    for column in ("主力净流入", "主力净流入率", "超大单净流入", "大单净流入", "大单净流入率", "收盘价", "涨跌幅"):
+        daily[column] = pd.to_numeric(daily[column], errors="coerce").round(4)
+    daily["可用时间"] = daily["可用时间"].map(_format_etf_timestamp)
+    daily["抓取时间"] = daily["抓取时间"].map(_format_etf_timestamp)
+    daily = daily[daily_columns].sort_values(["交易日", "标的"], ascending=[False, True])
+
+    run_rows = []
+    for run in runs:
+        run_rows.append([
+            run.get("run_id"), run.get("status", ""),
+            _format_etf_timestamp(run.get("started_at")),
+            _format_etf_timestamp(run.get("finished_at")),
+            run.get("requested_count", 0), run.get("successful_count", 0),
+            run.get("failed_count", 0), run.get("retry_count", 0),
+            json.dumps(run.get("details") or {}, ensure_ascii=False, default=str),
+        ])
+    runs_df = pd.DataFrame(run_rows, columns=run_columns)
+
+    chart = go.Figure()
+    for symbol, group in raw.groupby("symbol", sort=True):
+        chart.add_trace(go.Scatter(
+            x=group["trade_date"], y=group["main_net_inflow"],
+            mode="lines+markers", name=str(symbol),
+        ))
+    chart.add_hline(y=0, line_dash="dot", line_color="#888")
+    chart.update_layout(
+        title="观察池主力净流入趋势（数据库已入库数据）",
+        height=420, template="plotly_dark", hovermode="x unified",
+        xaxis_title="交易日", yaxis_title="主力净流入",
+        margin=dict(l=55, r=20, t=55, b=35),
+    )
+    return summary, daily, runs_df, chart
+
+
+def _load_etf_panel(watchlist_text: str, lookback_days: float | int | None):
+    """Read ETF flow rows without touching the public data source."""
+    try:
+        targets = parse_watchlist(watchlist_text)
+    except ValueError as exc:
+        return f"❌ 观察池格式错误：{exc}", *_etf_display_frames([], [])
+    days = max(1, int(lookback_days or 30))
+    end_date = _etf_today()
+    start_date = end_date - timedelta(days=days - 1)
+    repository = _etf_repository()
+    rows = repository.fetch_daily(
+        symbols=[target.symbol for target in targets],
+        start_date=start_date,
+        end_date=end_date,
+    )
+    runs = repository.fetch_latest_runs(limit=20)
+    summary, daily, runs_df, chart = _etf_display_frames(rows, runs)
+    if rows:
+        status = f"✅ 已加载 {len(rows)} 条日频记录，区间 {start_date} 至 {end_date}。"
+    else:
+        status = "ℹ️ 数据库暂无观察池记录，请点击“立即采集并入库”，或等待 APScheduler 定时任务。"
+    if runs:
+        latest = runs[0]
+        status += f" 最近任务：{latest.get('status', '-')}（{_format_etf_timestamp(latest.get('started_at'))}）。"
+    return status, summary, daily, runs_df, chart
+
+
+def _ingest_etf_panel(watchlist_text: str, lookback_days: float | int | None):
+    """Run one bounded collection attempt, then refresh all panel views."""
+    try:
+        targets = parse_watchlist(watchlist_text)
+    except ValueError as exc:
+        return f"❌ 观察池格式错误：{exc}", *_etf_display_frames([], [])
+    days = max(1, int(lookback_days or 30))
+    end_date = _etf_today()
+    start_date = end_date - timedelta(days=days - 1)
+    settings = _get_config_service().settings
+    database = Database(settings.database.dsn)
+    database.create_schema()
+    provider = AkShareFundFlowProvider(
+        config=AkShareFlowConfig(
+            request_interval_seconds=float(os.getenv("VNTDR_AKSHARE_REQUEST_INTERVAL", "0.25")),
+            max_retries=int(os.getenv("VNTDR_AKSHARE_MAX_RETRIES", "3")),
+            retry_backoff_seconds=float(os.getenv("VNTDR_AKSHARE_RETRY_BACKOFF", "1.0")),
+        )
+    )
+    try:
+        result = EtfFlowIngestionService(
+            provider=provider,
+            repository=EtfMoneyFlowRepository(database),
+            watchlist=targets,
+            lookback_days=days,
+        ).run(start_date=start_date, end_date=end_date)
+    except Exception as exc:  # noqa: BLE001 - surface source/config failures in the panel
+        panel = _load_etf_panel(watchlist_text, days)
+        return f"❌ 本次采集未完成（可重试）：{exc}\n\n{panel[0]}", *panel[1:]
+    status, summary, daily, runs_df, chart = _load_etf_panel(watchlist_text, days)
+    outcome = result.get("status", "unknown")
+    task_status = result.get("task_status", "unknown")
+    status = (
+        f"📥 本次采集：{outcome}；成功 {result.get('successful_count', 0)}/"
+        f"{result.get('requested_count', len(targets))}，入库 {result.get('rows_inserted', 0)} 行，"
+        f"重试 {result.get('retry_count', 0)} 次；任务状态：{task_status}。\n\n{status}"
+    )
+    return status, summary, daily, runs_df, chart
 
 
 def _get_target_parameters(target: dict[str, Any], cs: ConfigService) -> dict[str, Any]:
@@ -720,17 +940,27 @@ def main(port: int | None = None) -> None:
                         global_sync_status = gr.Textbox(label="数据同步状态", interactive=False)
 
                         with gr.Accordion("⚙️ 策略参数与微调 (Backtest)", open=True):
+                            bt_trade_mode = gr.Dropdown(
+                                label="策略方向",
+                                choices=[
+                                    ("多空双做 (Both)", "both"),
+                                    ("只做多 (Long Only)", "long_only"),
+                                    ("只做空 (Short Only)", "short_only"),
+                                ],
+                                value="both",
+                                info="方向属于当前策略配置，会随回测/寻优参数一起保存和复用。",
+                            )
                             bt_params_lookback = gr.Textbox(
                                 label="demo_momentum 参数",
-                                value="lookback=3",
+                                value="lookback=3\ntrade_mode=both",
                                 visible=False,
-                                lines=3,
+                                lines=4,
                             )
                             bt_params_macd = gr.Textbox(
                                 label="策略参数",
-                                value="fast_length=6\nslow_length=21\nsignal_length=3\ntrend_window=7",
+                                value="fast_length=6\nslow_length=21\nsignal_length=3\ntrend_window=7\ntrade_mode=both",
                                 visible=True,
-                                lines=4,
+                                lines=5,
                             )
                             bt_run_btn = gr.Button("▶️ 运行策略回测", variant="primary")
                             bt_status = gr.Textbox(label="回测状态", interactive=False)
@@ -819,10 +1049,20 @@ def main(port: int | None = None) -> None:
                                     value=1.0,
                                     interactive=True,
                                 )
+                            manage_trade_mode = gr.Dropdown(
+                                label="策略方向",
+                                choices=[
+                                    ("多空双做 (Both)", "both"),
+                                    ("只做多 (Long Only)", "long_only"),
+                                    ("只做空 (Short Only)", "short_only"),
+                                ],
+                                value="both",
+                                interactive=True,
+                            )
                             manage_params = gr.Textbox(
                                 label="策略运行参数 (每行 key=val)",
-                                value="fast_length=6\nslow_length=21\nsignal_length=3\ntrend_window=7",
-                                lines=4,
+                                value="fast_length=6\nslow_length=21\nsignal_length=3\ntrend_window=7\ntrade_mode=both",
+                                lines=5,
                                 interactive=True,
                             )
                             with gr.Row():
@@ -894,6 +1134,53 @@ def main(port: int | None = None) -> None:
                         btn_remove_target = gr.Button("🗑️ 移除选中的监控目标", variant="stop", scale=1)
                     manage_status = gr.Textbox(label="操作状态", interactive=False)
 
+            # ── Tab 3: 📊 ETF 资金流 ───────────────────────────
+            with gr.Tab("📊 ETF资金流", id="tab_etf_flow"):
+                gr.Markdown(
+                    "### 观察池资金趋势\n"
+                    "数据由独立 `etf_ingest` APScheduler 任务写入数据库；面板默认只读数据库。"
+                    "手动采集只执行一次有界任务，失败会标记为可重试，常驻任务负责继续重试。"
+                )
+                with gr.Row():
+                    etf_watchlist = gr.Textbox(
+                        label="ETF 观察池（逗号分隔，可写 symbol:market）",
+                        value=_etf_default_watchlist_text(),
+                        info="默认：588200、510300、588170、588080、159845、159941、512400",
+                        scale=4,
+                    )
+                    etf_lookback = gr.Number(
+                        label="面板回看天数", value=30, minimum=1, precision=0, scale=1,
+                    )
+                with gr.Row():
+                    etf_refresh_btn = gr.Button("🔄 刷新数据库视图", variant="secondary")
+                    etf_ingest_btn = gr.Button("📥 立即采集并入库", variant="primary")
+                etf_status = gr.Markdown("点击刷新查看数据库中的 ETF 资金流。")
+                etf_summary_table = gr.Dataframe(
+                    headers=[
+                        "标的", "市场", "观测天数", "主力累计净流入", "主力正流入天数",
+                        "主力正流入占比", "最新主力净流入", "最新主力净流入率", "最新收盘价",
+                        "最新涨跌幅", "最后交易日",
+                    ],
+                    label="观察池趋势摘要（按累计主力净流入排序）",
+                    interactive=False,
+                )
+                etf_trend_plot = gr.Plot(label="主力净流入趋势")
+                etf_daily_table = gr.Dataframe(
+                    headers=[
+                        "交易日", "标的", "市场", "主力净流入", "主力净流入率", "超大单净流入",
+                        "大单净流入", "大单净流入率", "收盘价", "涨跌幅", "可用时间", "抓取时间", "重试次数",
+                    ],
+                    label="日频资金流明细",
+                    interactive=False,
+                )
+                etf_runs_table = gr.Dataframe(
+                    headers=[
+                        "运行 ID", "状态", "开始时间", "结束时间", "请求数", "成功数", "失败数", "重试次数", "详情",
+                    ],
+                    label="最近采集任务（retryable 表示可由调度器继续重试）",
+                    interactive=False,
+                )
+
             with gr.Tab("🧩 策略平台", id="tab_platform"):
                 gr.Markdown("### 版本化策略实例\n新版本需通过回测、走查和影子验证后，使用 `vntdr strategy-approve` 激活。当前发布仅通知，不会下单。")
                 platform_instances = gr.Dataframe(
@@ -943,11 +1230,6 @@ def main(port: int | None = None) -> None:
                             label="寻优打分排序指标",
                             choices=[("夏普比率 (Sharpe)", "sharpe"), ("总收益率 (Return)", "return")],
                         )
-                        cfg_trade_mode = gr.Dropdown(
-                            label="交易模式 (多空/仅多/仅空)",
-                            choices=[("多空双开 (Both)", "both"), ("只做多仓 (Long Only)", "long_only"), ("只做空仓 (Short Only)", "short_only")],
-                        )
-
                     with gr.Column():
                         gr.Markdown("### 🛡️ 风控参数与限制")
                         cfg_max_capital = gr.Number(label="单策略最大资金", precision=4)
@@ -1007,12 +1289,13 @@ def main(port: int | None = None) -> None:
             except Exception as e:
                 return f"错误：{e}"
 
-        def run_backtest(strategy_name, symbol, interval, start, end, params_text):
+        def run_backtest(strategy_name, symbol, interval, start, end, trade_mode, params_text):
             try:
                 ctx, _, _ = _get_services()
                 if not start or not end:
                     return "请先输入日期", None, None, None, None
                 parameters = _parse_params(params_text)
+                parameters["trade_mode"] = trade_mode or "both"
                 config = ResearchJobConfig(
                     strategy_name=strategy_name, symbol=symbol,
                     interval=interval,
@@ -1070,7 +1353,7 @@ def main(port: int | None = None) -> None:
             except Exception as e:
                 return f"错误：{e}", None, None, None, None
 
-        def run_optimize(strategy_name, symbol, interval, start, end, space_text, auto_fit, method, optimize_target):
+        def run_optimize(strategy_name, symbol, interval, start, end, trade_mode, space_text, auto_fit, method, optimize_target):
             try:
                 ctx, _, _ = _get_services()
                 if not start or not end:
@@ -1086,6 +1369,7 @@ def main(port: int | None = None) -> None:
                     start=_parse_datetime(start),
                     end=_parse_datetime(end, is_end=True),
                     mode="optimize",
+                    parameters={"trade_mode": trade_mode or "both"},
                     parameter_space=parameter_space,
                     optimize_target=optimize_target,
                 )
@@ -1112,7 +1396,7 @@ def main(port: int | None = None) -> None:
 
         def run_walk_forward(
             strategy_name, symbol, interval, start, end,
-            space_text, train_window, test_window, auto_fit, method, optimize_target,
+            trade_mode, space_text, train_window, test_window, auto_fit, method, optimize_target,
         ):
             try:
                 ctx, _, _ = _get_services()
@@ -1130,6 +1414,7 @@ def main(port: int | None = None) -> None:
                     end=_parse_datetime(end, is_end=True),
                     mode="walk-forward",
                     method=method,
+                    parameters={"trade_mode": trade_mode or "both"},
                     parameter_space=parameter_space,
                     train_window=int(train_window),
                     test_window=int(test_window),
@@ -1238,9 +1523,11 @@ def main(port: int | None = None) -> None:
                 return f"错误：{e}", None, None, None, None, None
 
         def fetch_live_status():
-            import redis
             import json
             from datetime import datetime, timezone
+
+            import redis
+
             from vntdr.adapters.orders import OkxOrderExecutor
             
             cs = _get_config_service()
@@ -1399,21 +1686,23 @@ def main(port: int | None = None) -> None:
             outputs=[global_sync_status],
         )
 
-        def run_backtest_dispatch(strategy_name, symbol, interval, start, end, params_lookback, params_macd):
+        def run_backtest_dispatch(strategy_name, symbol, interval, start, end, trade_mode, params_lookback, params_macd):
             params_text = params_lookback if strategy_name == "demo_momentum" else params_macd
-            status, metrics, params, chart, trades_df = run_backtest(strategy_name, symbol, interval, start, end, params_text)
+            status, metrics, params, chart, trades_df = run_backtest(
+                strategy_name, symbol, interval, start, end, trade_mode, params_text
+            )
             return status, metrics, params, chart, trades_df, gr.update(selected="visual_backtest")
 
         bt_run_btn.click(
             run_backtest_dispatch,
             inputs=[
                 global_strategy, global_symbol, global_interval, global_start, global_end,
-                bt_params_lookback, bt_params_macd,
+                bt_trade_mode, bt_params_lookback, bt_params_macd,
             ],
             outputs=[bt_status, bt_metrics_table, bt_params_table, bt_chart, bt_trades_table, visual_tabs],
         )
 
-        def manage_add_target(strategy, symbol, interval, volume, params_text):
+        def manage_add_target(strategy, symbol, interval, volume, trade_mode, params_text):
             try:
                 if not symbol or not interval or not strategy:
                     df, choices, val = _get_targets_df_and_choices()
@@ -1422,6 +1711,7 @@ def main(port: int | None = None) -> None:
                 cs = _get_config_service()
                 targets = cs.get("research.monitored_targets") or []
                 params = _parse_params(params_text or "")
+                params["trade_mode"] = trade_mode or "both"
                 
                 # Check if duplicate
                 for t in targets:
@@ -1450,7 +1740,7 @@ def main(port: int | None = None) -> None:
                 df, choices, val = _get_targets_df_and_choices()
                 return f"❌ 添加监控目标失败: {e}", df, gr.update(choices=choices), gr.update(choices=choices)
 
-        def manage_update_target(selected_str, strategy, symbol, interval, volume, params_text):
+        def manage_update_target(selected_str, strategy, symbol, interval, volume, trade_mode, params_text):
             try:
                 if not selected_str:
                     df, choices, val = _get_targets_df_and_choices()
@@ -1462,6 +1752,7 @@ def main(port: int | None = None) -> None:
                 cs = _get_config_service()
                 targets = cs.get("research.monitored_targets") or []
                 params = _parse_params(params_text or "")
+                params["trade_mode"] = trade_mode or "both"
                 
                 # Find the index of the selected target
                 found_idx = -1
@@ -1546,7 +1837,7 @@ def main(port: int | None = None) -> None:
 
         def on_select_target_change(selected_str):
             if not selected_str:
-                return gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
+                return gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
             try:
                 cs = _get_config_service()
                 targets = cs.get("research.monitored_targets") or []
@@ -1556,24 +1847,30 @@ def main(port: int | None = None) -> None:
                         strat = t.get("strategy_name")
                         p = _get_target_parameters(t, cs)
                         params_text = "\n".join(f"{k}={v}" for k, v in p.items())
+                        mode = p.get(
+                            "trade_mode",
+                            STRATEGY_PARAMS.get(strat, {}).get("defaults", {}).get("trade_mode", "both"),
+                        )
                         return (
                             gr.update(value=strat),
                             gr.update(value=t.get("symbol")),
                             gr.update(value=t.get("interval")),
                             gr.update(value=t.get("volume", 1.0)),
+                            gr.update(value=mode),
                             gr.update(value=params_text)
                         )
             except Exception:
                 pass
-            return gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
+            return gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
 
-        def autofill_from_backtest(strategy, symbol, interval, params_lookback, params_macd):
+        def autofill_from_backtest(strategy, symbol, interval, trade_mode, params_lookback, params_macd):
             params_text = params_lookback if strategy == "demo_momentum" else params_macd
             return (
                 gr.update(value=strategy),
                 gr.update(value=symbol),
                 gr.update(value=interval),
                 gr.update(value=1.0),
+                gr.update(value=trade_mode or "both"),
                 gr.update(value=params_text)
             )
 
@@ -1585,31 +1882,34 @@ def main(port: int | None = None) -> None:
                 if not p:
                     p = STRATEGY_PARAMS.get(strategy_name, {}).get("defaults", {})
                 params_text = "\n".join(f"{k}={v}" for k, v in p.items())
-                return gr.update(value=params_text)
+                return (
+                    gr.update(value=params_text),
+                    gr.update(value=p.get("trade_mode", "both")),
+                )
             except Exception:
-                return gr.update()
+                return gr.update(), gr.update()
 
         manage_select_target.change(
             on_select_target_change,
             inputs=[manage_select_target],
-            outputs=[manage_strategy, manage_symbol, manage_interval, manage_volume, manage_params]
+            outputs=[manage_strategy, manage_symbol, manage_interval, manage_volume, manage_trade_mode, manage_params]
         )
 
         manage_strategy.change(
             on_manage_strategy_change,
             inputs=[manage_strategy],
-            outputs=[manage_params]
+            outputs=[manage_params, manage_trade_mode]
         )
 
         manage_autofill_btn.click(
             autofill_from_backtest,
-            inputs=[global_strategy, global_symbol, global_interval, bt_params_lookback, bt_params_macd],
-            outputs=[manage_strategy, manage_symbol, manage_interval, manage_volume, manage_params]
+            inputs=[global_strategy, global_symbol, global_interval, bt_trade_mode, bt_params_lookback, bt_params_macd],
+            outputs=[manage_strategy, manage_symbol, manage_interval, manage_volume, manage_trade_mode, manage_params]
         )
 
         manage_add_btn.click(
             manage_add_target,
-            inputs=[manage_strategy, manage_symbol, manage_interval, manage_volume, manage_params],
+            inputs=[manage_strategy, manage_symbol, manage_interval, manage_volume, manage_trade_mode, manage_params],
             outputs=[manage_status, manage_table, manage_select_target, remove_target_select]
         ).then(
             fetch_live_status,
@@ -1618,7 +1918,7 @@ def main(port: int | None = None) -> None:
 
         manage_update_btn.click(
             manage_update_target,
-            inputs=[manage_select_target, manage_strategy, manage_symbol, manage_interval, manage_volume, manage_params],
+            inputs=[manage_select_target, manage_strategy, manage_symbol, manage_interval, manage_volume, manage_trade_mode, manage_params],
             outputs=[manage_status, manage_table, manage_select_target, remove_target_select]
         ).then(
             fetch_live_status,
@@ -1634,9 +1934,10 @@ def main(port: int | None = None) -> None:
             outputs=[live_health, live_config, live_account, live_positions, live_logs_table]
         )
 
-        def run_optimize_dispatch(strategy_name, symbol, interval, start, end, space_text, auto_fit, method, optimize_target):
+        def run_optimize_dispatch(strategy_name, symbol, interval, start, end, trade_mode, space_text, auto_fit, method, optimize_target):
             status, metrics, params, top_table, best_params, top_results = run_optimize(
-                strategy_name, symbol, interval, start, end, space_text, auto_fit, method, optimize_target
+                strategy_name, symbol, interval, start, end, trade_mode,
+                space_text, auto_fit, method, optimize_target
             )
             choices = []
             if top_results:
@@ -1657,7 +1958,7 @@ def main(port: int | None = None) -> None:
 
         opt_run_btn.click(
             run_optimize_dispatch,
-            inputs=[global_strategy, global_symbol, global_interval, global_start, global_end, opt_space, opt_auto_fit, opt_method, opt_target],
+            inputs=[global_strategy, global_symbol, global_interval, global_start, global_end, bt_trade_mode, opt_space, opt_auto_fit, opt_method, opt_target],
             outputs=[opt_status, opt_metrics_table, opt_params_table, opt_top_table, opt_best_params, opt_top_results, opt_select_combo, visual_tabs],
         )
 
@@ -1670,47 +1971,49 @@ def main(port: int | None = None) -> None:
                 params_to_apply = best_params
                 
             if not params_to_apply:
-                return "未找到可选参数，请先运行寻优", gr.update(), gr.update(), gr.update(), gr.update()
+                return "未找到可选参数，请先运行寻优", gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
             
             # Format parameters as key=value strings
             formatted = "\n".join(f"{k}={v}" for k, v in params_to_apply.items())
             
             # Decide which textbox to update and switch strategy/tab
+            selected_trade_mode = params_to_apply.get("trade_mode", "both")
             if strategy_name == "demo_momentum":
-                return "参数已应用到回测", formatted, gr.update(), gr.update(selected="visual_backtest"), strategy_name
+                return "参数已应用到回测", formatted, gr.update(), gr.update(selected="visual_backtest"), strategy_name, gr.update(value=selected_trade_mode)
             else:
-                return "参数已应用到回测", gr.update(), formatted, gr.update(selected="visual_backtest"), strategy_name
+                return "参数已应用到回测", gr.update(), formatted, gr.update(selected="visual_backtest"), strategy_name, gr.update(value=selected_trade_mode)
 
         opt_apply_btn.click(
             apply_opt_params,
             inputs=[global_strategy, opt_select_combo, opt_top_results, opt_best_params],
-            outputs=[opt_status, bt_params_lookback, bt_params_macd, visual_tabs, global_strategy],
+            outputs=[opt_status, bt_params_lookback, bt_params_macd, visual_tabs, global_strategy, bt_trade_mode],
         )
 
         def apply_best_params_direct(strategy_name, best_params):
             if not best_params:
-                return "未找到最优参数，请先运行寻优", gr.update(), gr.update()
+                return "未找到最优参数，请先运行寻优", gr.update(), gr.update(), gr.update()
             
             formatted = "\n".join(f"{k}={v}" for k, v in best_params.items())
-            
+            selected_trade_mode = best_params.get("trade_mode", "both")
+
             if strategy_name == "demo_momentum":
-                return "最优参数已填入回测面板", formatted, gr.update()
+                return "最优参数已填入回测面板", formatted, gr.update(), gr.update(value=selected_trade_mode)
             else:
-                return "最优参数已填入回测面板", gr.update(), formatted
+                return "最优参数已填入回测面板", gr.update(), formatted, gr.update(value=selected_trade_mode)
 
         opt_apply_best_btn.click(
             apply_best_params_direct,
             inputs=[global_strategy, opt_best_params],
-            outputs=[opt_status, bt_params_lookback, bt_params_macd],
+            outputs=[opt_status, bt_params_lookback, bt_params_macd, bt_trade_mode],
         )
 
         def run_walk_forward_dispatch(
             strategy_name, symbol, interval, start, end,
-            space_text, train_window, test_window, auto_fit, method, optimize_target,
+            trade_mode, space_text, train_window, test_window, auto_fit, method, optimize_target,
         ):
             status, metrics, params_df, folds_df, fig, trades_df = run_walk_forward(
                 strategy_name, symbol, interval, start, end,
-                space_text, train_window, test_window, auto_fit, method, optimize_target,
+                trade_mode, space_text, train_window, test_window, auto_fit, method, optimize_target,
             )
             return status, metrics, params_df, folds_df, fig, trades_df, gr.update(selected="visual_walk_forward")
 
@@ -1718,7 +2021,7 @@ def main(port: int | None = None) -> None:
             run_walk_forward_dispatch,
             inputs=[
                 global_strategy, global_symbol, global_interval, global_start, global_end,
-                opt_space, wf_train, wf_test, wf_auto_fit, wf_method, wf_target,
+                bt_trade_mode, opt_space, wf_train, wf_test, wf_auto_fit, wf_method, wf_target,
             ],
             outputs=[wf_status, wf_metrics_table, wf_params_table, wf_folds_table, wf_folds_plot, wf_trades_table, visual_tabs],
         )
@@ -1733,12 +2036,13 @@ def main(port: int | None = None) -> None:
                 space_text,
                 gr.update(visible=show_lookback, value=params_text if show_lookback else None),
                 gr.update(visible=show_macd, value=params_text if show_macd else None, label=f"{strategy_name} 参数"),
+                gr.update(value=defaults.get("trade_mode", "both")),
             )
 
         global_strategy.change(
             update_strategy_change,
             inputs=[global_strategy],
-            outputs=[opt_space, bt_params_lookback, bt_params_macd],
+            outputs=[opt_space, bt_params_lookback, bt_params_macd, bt_trade_mode],
         )
         opt_auto_fit.change(toggle_space_visibility, inputs=[opt_auto_fit], outputs=[opt_space])
 
@@ -1754,7 +2058,6 @@ def main(port: int | None = None) -> None:
             "research.taker_fee_rate",
             "research.use_maker_fee",
             "research.optimize_target",
-            "research.trade_mode",
             "risk.max_strategy_capital",
             "risk.max_total_exposure",
             "risk.max_drawdown",
@@ -1770,13 +2073,13 @@ def main(port: int | None = None) -> None:
             cfg_status,
             cfg_strategy, cfg_symbol, cfg_interval,
             cfg_order_size, cfg_rank_hours,
-            cfg_maker_fee, cfg_taker_fee, cfg_use_maker, cfg_optimize_target, cfg_trade_mode,
+            cfg_maker_fee, cfg_taker_fee, cfg_use_maker, cfg_optimize_target,
             cfg_max_capital, cfg_max_exposure, cfg_max_drawdown,
             cfg_max_order, cfg_allow_open,
             cfg_okx_key, cfg_okx_secret, cfg_okx_passphrase, cfg_okx_demo,
             global_strategy, global_symbol, global_interval,
             global_start, global_end,
-            bt_params_lookback, bt_params_macd,
+            bt_params_lookback, bt_params_macd, bt_trade_mode,
             remove_target_select,
             manage_table,
             manage_select_target,
@@ -1812,10 +2115,12 @@ def main(port: int | None = None) -> None:
             if not macd_p:
                 macd_p = STRATEGY_PARAMS.get("cm_macd_ult_mtf", {}).get("defaults", {})
             macd_p_text = "\n".join(f"{k}={v}" for k, v in macd_p.items())
+            selected_p = current_params.get(g_strat, {}) or STRATEGY_PARAMS.get(g_strat, {}).get("defaults", {})
+            selected_trade_mode = selected_p.get("trade_mode", "both")
 
             df, choices, val = _get_targets_df_and_choices()
             return ["当前配置已加载"] + vals + [
-                g_strat, g_sym, g_int, g_start, g_end, demo_p_text, macd_p_text,
+                g_strat, g_sym, g_int, g_start, g_end, demo_p_text, macd_p_text, selected_trade_mode,
                 gr.update(choices=choices, value=val),
                 df,
                 gr.update(choices=choices, value=val),
@@ -1824,7 +2129,7 @@ def main(port: int | None = None) -> None:
         def save_settings(
             strategy, symbol, interval,
             order_size, rank_hours,
-            maker_fee, taker_fee, use_maker, optimize_target, trade_mode,
+            maker_fee, taker_fee, use_maker, optimize_target,
             max_capital, max_exposure, max_drawdown,
             max_order, allow_open,
             api_key, secret_key, passphrase, demo_trading,
@@ -1835,7 +2140,7 @@ def main(port: int | None = None) -> None:
             values = [
                 strategy, symbol, interval,
                 order_size, rank_hours,
-                maker_fee, taker_fee, use_maker, optimize_target, trade_mode,
+                maker_fee, taker_fee, use_maker, optimize_target,
                 max_capital, max_exposure, max_drawdown,
                 max_order, allow_open,
                 api_key, secret_key, passphrase, demo_trading,
@@ -1873,10 +2178,14 @@ def main(port: int | None = None) -> None:
             if not macd_p:
                 macd_p = STRATEGY_PARAMS.get("cm_macd_ult_mtf", {}).get("defaults", {})
             macd_p_text = "\n".join(f"{k}={v}" for k, v in macd_p.items())
+            selected_p = current_params.get(g_strat, {}) or STRATEGY_PARAMS.get(g_strat, {}).get("defaults", {})
+            selected_trade_mode = selected_p.get("trade_mode", "both")
+            selected_p = current_params.get(g_strat, {}) or STRATEGY_PARAMS.get(g_strat, {}).get("defaults", {})
+            selected_trade_mode = selected_p.get("trade_mode", "both")
 
             df, choices, val = _get_targets_df_and_choices()
             return [f"已保存 {len(saved)} 项配置并同步到全局回测配置"] + vals + [
-                g_strat, g_sym, g_int, g_start, g_end, demo_p_text, macd_p_text,
+                g_strat, g_sym, g_int, g_start, g_end, demo_p_text, macd_p_text, selected_trade_mode,
                 gr.update(choices=choices, value=val),
                 df,
                 gr.update(choices=choices, value=val),
@@ -1913,7 +2222,7 @@ def main(port: int | None = None) -> None:
 
             df, choices, val = _get_targets_df_and_choices()
             return ["已重置全部配置且同步到全局回测配置"] + vals + [
-                g_strat, g_sym, g_int, g_start, g_end, demo_p_text, macd_p_text,
+                g_strat, g_sym, g_int, g_start, g_end, demo_p_text, macd_p_text, selected_trade_mode,
                 gr.update(choices=choices, value=val),
                 df,
                 gr.update(choices=choices, value=val),
@@ -1924,7 +2233,7 @@ def main(port: int | None = None) -> None:
             inputs=[
                 cfg_strategy, cfg_symbol, cfg_interval,
                 cfg_order_size, cfg_rank_hours,
-                cfg_maker_fee, cfg_taker_fee, cfg_use_maker, cfg_optimize_target, cfg_trade_mode,
+                cfg_maker_fee, cfg_taker_fee, cfg_use_maker, cfg_optimize_target,
                 cfg_max_capital, cfg_max_exposure, cfg_max_drawdown,
                 cfg_max_order, cfg_allow_open,
                 cfg_okx_key, cfg_okx_secret, cfg_okx_passphrase, cfg_okx_demo,
@@ -1937,6 +2246,17 @@ def main(port: int | None = None) -> None:
         live_refresh_btn.click(
             fetch_live_status,
             outputs=[live_health, live_config, live_account, live_positions, live_logs_table]
+        )
+        etf_outputs = [etf_status, etf_summary_table, etf_daily_table, etf_runs_table, etf_trend_plot]
+        etf_refresh_btn.click(
+            _load_etf_panel,
+            inputs=[etf_watchlist, etf_lookback],
+            outputs=etf_outputs,
+        )
+        etf_ingest_btn.click(
+            _ingest_etf_panel,
+            inputs=[etf_watchlist, etf_lookback],
+            outputs=etf_outputs,
         )
         platform_refresh_btn.click(_platform_instances_df, outputs=[platform_instances])
         shadow_refresh_btn.click(_shadow_runs_df, outputs=[shadow_runs])
@@ -2019,6 +2339,10 @@ def main(port: int | None = None) -> None:
                 bt_params_lookback, bt_params_macd,
             ],
             outputs=[bt_status, bt_metrics_table, bt_params_table, bt_chart, bt_trades_table, visual_tabs],
+        ).then(
+            _load_etf_panel,
+            inputs=[etf_watchlist, etf_lookback],
+            outputs=etf_outputs,
         )
 
     app.launch(server_name="0.0.0.0", server_port=port)
