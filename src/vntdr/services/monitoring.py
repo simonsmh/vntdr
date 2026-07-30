@@ -459,6 +459,7 @@ class MonitoringService:
         symbol: str,
         interval: str,
         parameter_space: dict[str, list[Any]] | None = None,
+        parameters: dict[str, Any] | None = None,
         volume: float,
         method: str = "ga",
         lookback_bars: int = 120,
@@ -470,6 +471,7 @@ class MonitoringService:
                 symbol=symbol,
                 interval=interval,
                 parameter_space=parameter_space,
+                parameters=parameters,
                 volume=volume,
                 method=method,
                 lookback_bars=lookback_bars

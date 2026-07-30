@@ -71,13 +71,18 @@ def _parse_params(text: str) -> dict[str, Any]:
         if "=" in line:
             key, value = line.split("=", 1)
             key, value = key.strip(), value.strip()
-            try:
-                params[key] = int(value)
-            except ValueError:
+            if value.lower() == "true":
+                params[key] = True
+            elif value.lower() == "false":
+                params[key] = False
+            else:
                 try:
-                    params[key] = float(value)
+                    params[key] = int(value)
                 except ValueError:
-                    params[key] = value
+                    try:
+                        params[key] = float(value)
+                    except ValueError:
+                        params[key] = value
     return params
 
 
@@ -339,16 +344,32 @@ def _get_config_service():
     return _CONFIG_SERVICE
 
 
+def _get_target_parameters(target: dict[str, Any], cs: ConfigService) -> dict[str, Any]:
+    """Return parameters for one target, with legacy global fallback.
+
+    Older target records do not have their own parameters and continue to use
+    the strategy-level override. New or edited records can therefore be
+    isolated without requiring a one-time migration of the override file.
+    """
+    target_parameters = target.get("parameters")
+    if isinstance(target_parameters, dict) and target_parameters:
+        return dict(target_parameters)
+
+    current_params = cs.get("research.strategy_parameters") or {}
+    strategy_name = target.get("strategy_name", "")
+    parameters = current_params.get(strategy_name, {}) if isinstance(current_params, dict) else {}
+    if parameters:
+        return dict(parameters)
+    return dict(STRATEGY_PARAMS.get(strategy_name, {}).get("defaults", {}))
+
+
 def _get_targets_df_and_choices():
     cs = _get_config_service()
     targets = cs.get("research.monitored_targets") or []
     rows = []
     for idx, t in enumerate(targets):
         strat = t.get("strategy_name", "")
-        current_params = cs.get("research.strategy_parameters") or {}
-        p = current_params.get(strat, {})
-        if not p:
-            p = STRATEGY_PARAMS.get(strat, {}).get("defaults", {})
+        p = _get_target_parameters(t, cs)
         params_str = ", ".join(f"{k}={v}" for k, v in p.items())
         rows.append([
             idx + 1,
@@ -1400,6 +1421,7 @@ def main(port: int | None = None) -> None:
                 
                 cs = _get_config_service()
                 targets = cs.get("research.monitored_targets") or []
+                params = _parse_params(params_text or "")
                 
                 # Check if duplicate
                 for t in targets:
@@ -1412,35 +1434,10 @@ def main(port: int | None = None) -> None:
                     "strategy_name": strategy,
                     "symbol": symbol,
                     "interval": interval.lower(),
-                    "volume": float(volume)
+                    "volume": float(volume),
+                    "parameters": params,
                 })
                 cs.set("research.monitored_targets", targets)
-                
-                # Save strategy parameters from manage_params
-                params = {}
-                for line in params_text.split("\n"):
-                    if "=" in line:
-                        k, v = line.split("=", 1)
-                        k = k.strip()
-                        v = v.strip()
-                        if v.lower() == "true":
-                            params[k] = True
-                        elif v.lower() == "false":
-                            params[k] = False
-                        else:
-                            try:
-                                if "." in v:
-                                    params[k] = float(v)
-                                else:
-                                    params[k] = int(v)
-                            except ValueError:
-                                params[k] = v
-                
-                current_params = cs.get("research.strategy_parameters") or {}
-                if not isinstance(current_params, dict):
-                    current_params = {}
-                current_params[strategy] = params
-                cs.set("research.strategy_parameters", current_params)
                 
                 df, choices, val = _get_targets_df_and_choices()
                 return (
@@ -1464,6 +1461,7 @@ def main(port: int | None = None) -> None:
                 
                 cs = _get_config_service()
                 targets = cs.get("research.monitored_targets") or []
+                params = _parse_params(params_text or "")
                 
                 # Find the index of the selected target
                 found_idx = -1
@@ -1484,40 +1482,19 @@ def main(port: int | None = None) -> None:
                             df, choices, val = _get_targets_df_and_choices()
                             return f"⚠️ 更新失败：另一个监控目标 {symbol} ({interval} - {strategy}) 已存在！", df, gr.update(choices=choices, value=val), gr.update(choices=choices, value=val)
                 
-                # Update fields
-                targets[found_idx] = {
+                # Update only the selected target. Parameters are stored on
+                # the target instead of under the strategy name, because
+                # multiple targets may use the same strategy independently.
+                updated_target = dict(targets[found_idx])
+                updated_target.update({
                     "strategy_name": strategy,
                     "symbol": symbol,
                     "interval": interval.lower(),
-                    "volume": float(volume)
-                }
+                    "volume": float(volume),
+                    "parameters": params,
+                })
+                targets[found_idx] = updated_target
                 cs.set("research.monitored_targets", targets)
-                
-                # Save strategy parameters from manage_params
-                params = {}
-                for line in params_text.split("\n"):
-                    if "=" in line:
-                        k, v = line.split("=", 1)
-                        k = k.strip()
-                        v = v.strip()
-                        if v.lower() == "true":
-                            params[k] = True
-                        elif v.lower() == "false":
-                            params[k] = False
-                        else:
-                            try:
-                                if "." in v:
-                                    params[k] = float(v)
-                                else:
-                                    params[k] = int(v)
-                            except ValueError:
-                                params[k] = v
-                
-                current_params = cs.get("research.strategy_parameters") or {}
-                if not isinstance(current_params, dict):
-                    current_params = {}
-                current_params[strategy] = params
-                cs.set("research.strategy_parameters", current_params)
                 
                 df, choices, val = _get_targets_df_and_choices()
                 new_val = choices[found_idx] if found_idx < len(choices) else val
@@ -1577,10 +1554,7 @@ def main(port: int | None = None) -> None:
                     match_str = f"{t['symbol']} ({t['interval']} - {t['strategy_name']})"
                     if match_str == selected_str:
                         strat = t.get("strategy_name")
-                        current_params = cs.get("research.strategy_parameters") or {}
-                        p = current_params.get(strat, {})
-                        if not p:
-                            p = STRATEGY_PARAMS.get(strat, {}).get("defaults", {})
+                        p = _get_target_parameters(t, cs)
                         params_text = "\n".join(f"{k}={v}" for k, v in p.items())
                         return (
                             gr.update(value=strat),

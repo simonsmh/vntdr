@@ -277,6 +277,7 @@ class CommandContext:
         interval: str,
         method: str,
         volume: float,
+        parameters: dict[str, Any] | None = None,
         parameter_space: dict[str, list[Any]] | None = None,
     ) -> MonitorResult:
         self.refresh_runtime_config()
@@ -284,6 +285,7 @@ class CommandContext:
             strategy_name=strategy_name,
             symbol=symbol,
             interval=interval,
+            parameters=parameters,
             parameter_space=parameter_space,
             volume=volume,
             method=method,
@@ -298,6 +300,7 @@ class CommandContext:
         interval: str,
         method: str,
         volume: float,
+        parameters: dict[str, Any] | None = None,
         parameter_space: dict[str, list[Any]] | None = None,
     ) -> MonitorResult:
         self.refresh_runtime_config()
@@ -305,6 +308,7 @@ class CommandContext:
             strategy_name=strategy_name,
             symbol=symbol,
             interval=interval,
+            parameters=parameters,
             parameter_space=parameter_space,
             volume=volume,
             method=method,
@@ -963,8 +967,11 @@ def live_command(
             sym = tgt.get("symbol", symbol or settings.research.default_symbol)
             inv = tgt.get("interval", interval or settings.research.default_interval)
             vol = tgt.get("volume", settings.research.default_order_size)
+            target_parameters = tgt.get("parameters")
+            if not isinstance(target_parameters, dict) or not target_parameters:
+                target_parameters = None
 
-            def target_task(s_name=s_name, sym=sym, inv=inv, vol=vol):
+            def target_task(s_name=s_name, sym=sym, inv=inv, vol=vol, target_parameters=target_parameters):
                 # 1. Incremental Sync
                 sync_target_market_data(context, sym, inv, logger)
                 # 2. Run Monitor
@@ -974,6 +981,7 @@ def live_command(
                     interval=inv,
                     method=method,
                     volume=vol,
+                    parameters=target_parameters,
                 )
 
             futures.append(executor.submit(target_task))
