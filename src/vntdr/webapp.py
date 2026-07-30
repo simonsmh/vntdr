@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from datetime import date, datetime, timedelta, timezone
+from threading import Lock
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -35,6 +36,23 @@ from vntdr.storage.repositories import (
 )
 from vntdr.strategies.registry import available_strategy_names, strategy_configs
 from vntdr.strategies.indicators import kdj_series, rolling_mean, rsi_series
+
+_PREVIEW_LOCK = Lock()
+_PREVIEW_VERSION = 0
+
+
+def _start_preview() -> int:
+    """Start a chart preview request and return its monotonic version."""
+
+    global _PREVIEW_VERSION
+    with _PREVIEW_LOCK:
+        _PREVIEW_VERSION += 1
+        return _PREVIEW_VERSION
+
+
+def _is_current_preview(version: int) -> bool:
+    with _PREVIEW_LOCK:
+        return version == _PREVIEW_VERSION
 
 # ── 工具函数 ──────────────────────────────────────────────────────────
 
@@ -893,7 +911,7 @@ def main(port: int | None = None) -> None:
                 with gr.Row():
                     # ── 左侧：主视图（总是展示图表与数据）──
                     with gr.Column(scale=3):
-                        bt_chart = gr.Plot(label="K线 · 信号 · MACD指标")
+                        bt_chart = gr.Plot(label="K线 · 信号 · 策略指标")
                         
                         visual_tabs = gr.Tabs()
                         with visual_tabs:
@@ -989,7 +1007,7 @@ def main(port: int | None = None) -> None:
                         )
                         global_sync_status = gr.Textbox(label="数据同步状态", interactive=False)
 
-                        with gr.Accordion("⚙️ 策略参数与微调 (Backtest)", open=True):
+                        with gr.Accordion("⚙️ 策略参数与辅助调优", open=True):
                             bt_trade_mode = gr.Dropdown(
                                 label="策略方向",
                                 choices=[
@@ -1001,13 +1019,13 @@ def main(port: int | None = None) -> None:
                                 info="方向属于当前策略配置，会随回测/寻优参数一起保存和复用。",
                             )
                             bt_params_lookback = gr.Textbox(
-                                label="demo_momentum 参数",
+                                label="当前策略参数（用于回测、寻优与部署）· demo_momentum",
                                 value="lookback=3\ntrade_mode=both",
                                 visible=False,
                                 lines=4,
                             )
                             bt_params_macd = gr.Textbox(
-                                label="策略参数",
+                                label="当前策略参数（用于回测、寻优与部署）",
                                 value="fast_length=6\nslow_length=21\nsignal_length=3\ntrend_window=7\ntrade_mode=both",
                                 visible=True,
                                 lines=5,
@@ -1015,7 +1033,11 @@ def main(port: int | None = None) -> None:
                             bt_run_btn = gr.Button("▶️ 运行策略回测", variant="primary")
                             bt_status = gr.Textbox(label="回测状态", interactive=False)
 
-                        with gr.Accordion("⚡ 辅助调参寻优 (Parameter Optimization)", open=False):
+                            gr.Markdown("#### ⚡ 辅助参数寻优")
+                            gr.Markdown(
+                                "方向和上面的策略配置一致；寻优只搜索下方指定的数值参数，"
+                                "不会把多空模式混入参数空间。"
+                            )
                             with gr.Row():
                                 opt_method = gr.Dropdown(
                                     label="寻优算法",
@@ -1412,23 +1434,93 @@ def main(port: int | None = None) -> None:
             except Exception as e:
                 return f"错误：{e}", None, None, None, None
 
-        def run_optimize(strategy_name, symbol, interval, start, end, trade_mode, space_text, auto_fit, method, optimize_target):
+        def preview_strategy_chart(
+            strategy_name, symbol, interval, start, end, trade_mode,
+            params_lookback, params_macd,
+        ):
+            """Refresh only the chart when a research control changes.
+
+            This deliberately skips report persistence and metric tables. The
+            full backtest button remains the authoritative research action,
+            while this path keeps strategy switching and filter changes
+            responsive enough for visual exploration.
+            """
+            preview_version = _start_preview()
+
+            def result(chart, message):
+                # A user can change strategy several times while an earlier
+                # request is loading. Never let an older response overwrite
+                # the latest selected strategy's chart or status.
+                if not _is_current_preview(preview_version):
+                    return gr.update(), gr.update()
+                return chart, message
+
+            try:
+                if not start or not end:
+                    return result(gr.update(), "请输入日期后预览策略图表")
+                ctx, _, _ = _get_services()
+                params_text = params_lookback if strategy_name == "demo_momentum" else params_macd
+                parameters = _parse_params(params_text or "")
+                parameters["trade_mode"] = trade_mode or "both"
+                config = ResearchJobConfig(
+                    strategy_name=strategy_name,
+                    symbol=symbol,
+                    interval=interval,
+                    start=_parse_datetime(start),
+                    end=_parse_datetime(end, is_end=True),
+                    parameters=parameters,
+                )
+                bars = ctx._load_bars(config)
+                if len(bars) < 2:
+                    return result(gr.update(), "暂无足够K线，点击「同步行情数据」后再预览")
+                outcome = ctx._execute_backtest(bars, strategy_name, parameters)
+                if not outcome.signals:
+                    return result(gr.update(), "暂无可用信号，点击「运行策略回测」查看完整结果")
+
+                defaults = STRATEGY_PARAMS.get(strategy_name, {}).get("defaults", {})
+                fast_length = int(parameters.get("fast_length", defaults.get("fast_length", 4)))
+                slow_length = int(parameters.get("slow_length", defaults.get("slow_length", 8)))
+                signal_length = int(parameters.get("signal_length", defaults.get("signal_length", 3)))
+                chart = _build_kline_macd_chart(
+                    bars[: len(outcome.signals)],
+                    outcome.signals,
+                    fast_length,
+                    slow_length,
+                    signal_length,
+                    strategy_name=strategy_name,
+                    indicator_parameters=parameters,
+                )
+                return result(chart, f"已切换为 {strategy_name}，图表已自动刷新（{len(bars)} 根K线）")
+            except ValueError as exc:
+                return result(gr.update(), f"图表预览提示：{exc}")
+            except Exception as exc:  # noqa: BLE001 - surface preview failures in the UI
+                return result(gr.update(), f"图表预览失败：{exc}")
+
+        def run_optimize(
+            strategy_name, symbol, interval, start, end, trade_mode, params_text,
+            space_text, auto_fit, method, optimize_target,
+        ):
             try:
                 ctx, _, _ = _get_services()
                 if not start or not end:
-                    return "请先输入日期", None, None, None, {}
+                    return "请先输入日期", None, None, None, {}, []
                 
                 if auto_fit:
-                    parameter_space = _auto_fit_parameter_space(strategy_name)
+                    parameter_space = dict(_auto_fit_parameter_space(strategy_name))
                 else:
                     parameter_space = _parameter_space_from_text(space_text)
+                # Direction is selected once for this strategy run. It is a
+                # fixed strategy parameter, never an optimization dimension.
+                parameter_space.pop("trade_mode", None)
+                parameters = _parse_params(params_text or "")
+                parameters["trade_mode"] = trade_mode or "both"
                 config = ResearchJobConfig(
                     strategy_name=strategy_name, symbol=symbol,
                     interval=interval,
                     start=_parse_datetime(start),
                     end=_parse_datetime(end, is_end=True),
                     mode="optimize",
-                    parameters={"trade_mode": trade_mode or "both"},
+                    parameters=parameters,
                     parameter_space=parameter_space,
                     optimize_target=optimize_target,
                 )
@@ -1455,7 +1547,8 @@ def main(port: int | None = None) -> None:
 
         def run_walk_forward(
             strategy_name, symbol, interval, start, end,
-            trade_mode, space_text, train_window, test_window, auto_fit, method, optimize_target,
+            trade_mode, params_text, space_text, train_window, test_window,
+            auto_fit, method, optimize_target,
         ):
             try:
                 ctx, _, _ = _get_services()
@@ -1463,9 +1556,12 @@ def main(port: int | None = None) -> None:
                     return "请先输入日期", None, None, None, None, None
                 
                 if auto_fit:
-                    parameter_space = _auto_fit_parameter_space(strategy_name)
+                    parameter_space = dict(_auto_fit_parameter_space(strategy_name))
                 else:
                     parameter_space = _parameter_space_from_text(space_text)
+                parameter_space.pop("trade_mode", None)
+                parameters = _parse_params(params_text or "")
+                parameters["trade_mode"] = trade_mode or "both"
                 config = ResearchJobConfig(
                     strategy_name=strategy_name, symbol=symbol,
                     interval=interval,
@@ -1473,7 +1569,7 @@ def main(port: int | None = None) -> None:
                     end=_parse_datetime(end, is_end=True),
                     mode="walk-forward",
                     method=method,
-                    parameters={"trade_mode": trade_mode or "both"},
+                    parameters=parameters,
                     parameter_space=parameter_space,
                     train_window=int(train_window),
                     test_window=int(test_window),
@@ -1993,10 +2089,14 @@ def main(port: int | None = None) -> None:
             outputs=[live_health, live_config, live_account, live_positions, live_logs_table]
         )
 
-        def run_optimize_dispatch(strategy_name, symbol, interval, start, end, trade_mode, space_text, auto_fit, method, optimize_target):
+        def run_optimize_dispatch(
+            strategy_name, symbol, interval, start, end, trade_mode,
+            params_lookback, params_macd, space_text, auto_fit, method, optimize_target,
+        ):
+            params_text = params_lookback if strategy_name == "demo_momentum" else params_macd
             status, metrics, params, top_table, best_params, top_results = run_optimize(
                 strategy_name, symbol, interval, start, end, trade_mode,
-                space_text, auto_fit, method, optimize_target
+                params_text, space_text, auto_fit, method, optimize_target
             )
             choices = []
             if top_results:
@@ -2017,7 +2117,11 @@ def main(port: int | None = None) -> None:
 
         opt_run_btn.click(
             run_optimize_dispatch,
-            inputs=[global_strategy, global_symbol, global_interval, global_start, global_end, bt_trade_mode, opt_space, opt_auto_fit, opt_method, opt_target],
+            inputs=[
+                global_strategy, global_symbol, global_interval, global_start, global_end,
+                bt_trade_mode, bt_params_lookback, bt_params_macd,
+                opt_space, opt_auto_fit, opt_method, opt_target,
+            ],
             outputs=[opt_status, opt_metrics_table, opt_params_table, opt_top_table, opt_best_params, opt_top_results, opt_select_combo, visual_tabs],
         )
 
@@ -2068,11 +2172,14 @@ def main(port: int | None = None) -> None:
 
         def run_walk_forward_dispatch(
             strategy_name, symbol, interval, start, end,
-            trade_mode, space_text, train_window, test_window, auto_fit, method, optimize_target,
+            trade_mode, params_lookback, params_macd, space_text,
+            train_window, test_window, auto_fit, method, optimize_target,
         ):
+            params_text = params_lookback if strategy_name == "demo_momentum" else params_macd
             status, metrics, params_df, folds_df, fig, trades_df = run_walk_forward(
                 strategy_name, symbol, interval, start, end,
-                trade_mode, space_text, train_window, test_window, auto_fit, method, optimize_target,
+                trade_mode, params_text, space_text, train_window, test_window,
+                auto_fit, method, optimize_target,
             )
             return status, metrics, params_df, folds_df, fig, trades_df, gr.update(selected="visual_walk_forward")
 
@@ -2080,7 +2187,8 @@ def main(port: int | None = None) -> None:
             run_walk_forward_dispatch,
             inputs=[
                 global_strategy, global_symbol, global_interval, global_start, global_end,
-                bt_trade_mode, opt_space, wf_train, wf_test, wf_auto_fit, wf_method, wf_target,
+                bt_trade_mode, bt_params_lookback, bt_params_macd, opt_space,
+                wf_train, wf_test, wf_auto_fit, wf_method, wf_target,
             ],
             outputs=[wf_status, wf_metrics_table, wf_params_table, wf_folds_table, wf_folds_plot, wf_trades_table, visual_tabs],
         )
@@ -2096,6 +2204,7 @@ def main(port: int | None = None) -> None:
                 gr.update(visible=show_lookback, value=params_text if show_lookback else None),
                 gr.update(visible=show_macd, value=params_text if show_macd else None, label=f"{strategy_name} 参数"),
                 gr.update(value=defaults.get("trade_mode", "both")),
+                f"正在切换到 {strategy_name}，准备刷新图表…",
             )
 
         def refresh_strategy_choices(enabled, global_value, manage_value, add_value, default_value):
@@ -2117,8 +2226,32 @@ def main(port: int | None = None) -> None:
         global_strategy.change(
             update_strategy_change,
             inputs=[global_strategy],
-            outputs=[opt_space, bt_params_lookback, bt_params_macd, bt_trade_mode],
+            outputs=[opt_space, bt_params_lookback, bt_params_macd, bt_trade_mode, bt_status],
+        ).then(
+            preview_strategy_chart,
+            inputs=[
+                global_strategy, global_symbol, global_interval, global_start, global_end,
+                bt_trade_mode, bt_params_lookback, bt_params_macd,
+            ],
+            outputs=[bt_chart, bt_status],
         )
+        for _preview_component in (
+            global_symbol,
+            global_interval,
+            global_start,
+            global_end,
+            bt_trade_mode,
+            bt_params_lookback,
+            bt_params_macd,
+        ):
+            _preview_component.change(
+                preview_strategy_chart,
+                inputs=[
+                    global_strategy, global_symbol, global_interval, global_start, global_end,
+                    bt_trade_mode, bt_params_lookback, bt_params_macd,
+                ],
+                outputs=[bt_chart, bt_status],
+            )
         cfg_enabled_strategies.change(
             refresh_strategy_choices,
             inputs=[cfg_enabled_strategies, global_strategy, manage_strategy, add_strategy, cfg_strategy],
