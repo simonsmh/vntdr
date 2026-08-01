@@ -35,6 +35,27 @@ uv run vntdr akshare-csi300-flow \
 uv run vntdr etf-flow-ingest --max-retries 5
 ```
 
+扫描当前全市场、总市值不低于 100 亿元的 ETF：
+
+```bash
+uv run vntdr etf-universe-scan \
+  --min-market-cap 10000000000 \
+  --max-symbols 50
+```
+
+结果会写入 `reports/etf_universe_market_cap.csv`。资金流任务也可以按这份动态市值池运行，
+每次任务开始前重新扫描一次：
+
+```bash
+uv run vntdr etf-flow-scheduler \
+  --min-market-cap 10000000000 \
+  --max-universe-size 50
+```
+
+这里的阈值使用 AkShare ETF 实时行情中的 `总市值`（元），不是基金净资产规模；动态池可能包含
+货币、债券、商品或跨境 ETF。若只跟踪股票 ETF，建议后续再增加名称/类型过滤，并通过
+`--max-universe-size` 控制公开接口请求量。
+
 启动 APScheduler 常驻任务（工作日 16:10，Asia/Shanghai）：
 
 ```bash

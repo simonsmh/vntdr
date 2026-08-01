@@ -33,7 +33,9 @@ from vntdr.services.akshare_fund_flow import (
     month_bounds,
 )
 from vntdr.services.etf_flow_ingestion import (
+    DEFAULT_ETF_WATCHLIST,
     EtfFlowIngestionService,
+    EtfWatchTarget,
     parse_watchlist,
 )
 from vntdr.services.etf_flow_scheduler import EtfFlowScheduler
@@ -694,9 +696,15 @@ def _build_etf_flow_ingestion_service(
     timezone_name: str = "Asia/Shanghai",
     availability_hour: int = 16,
     availability_minute: int = 10,
+    min_market_cap: float | None = None,
+    max_universe_size: int | None = None,
 ) -> EtfFlowIngestionService:
     raw_watchlist = symbols or os.getenv("VNTDR_ETF_WATCHLIST")
     watchlist = parse_watchlist(raw_watchlist)
+    if min_market_cap is None and os.getenv("VNTDR_ETF_MIN_MARKET_CAP"):
+        min_market_cap = float(os.environ["VNTDR_ETF_MIN_MARKET_CAP"])
+    if max_universe_size is None and os.getenv("VNTDR_ETF_MAX_UNIVERSE_SIZE"):
+        max_universe_size = int(os.environ["VNTDR_ETF_MAX_UNIVERSE_SIZE"])
     database = Database(settings.database.dsn)
     database.create_schema()
     provider = AkShareFundFlowProvider(
@@ -707,6 +715,28 @@ def _build_etf_flow_ingestion_service(
             retry_jitter_seconds=retry_jitter_seconds,
         )
     )
+    watchlist_resolver = None
+    universe_label = "watchlist"
+    if min_market_cap is not None and not symbols:
+        if min_market_cap < 0:
+            raise ValueError("min_market_cap must be >= 0")
+        if max_universe_size is not None and max_universe_size < 1:
+            raise ValueError("max_universe_size must be >= 1 when provided")
+
+        def resolve_market_cap_universe() -> tuple[EtfWatchTarget, ...]:
+            universe = provider.fetch_etf_universe(
+                min_market_cap=min_market_cap,
+                max_symbols=max_universe_size,
+            )
+            return tuple(
+                EtfWatchTarget(row.symbol, row.market)
+                for row in universe.itertuples(index=False)
+            )
+
+        watchlist_resolver = resolve_market_cap_universe
+        # The resolver supplies the actual list immediately before each run.
+        watchlist = DEFAULT_ETF_WATCHLIST
+        universe_label = f"total_market_cap>={min_market_cap:g}"
     return EtfFlowIngestionService(
         provider=provider,
         repository=EtfMoneyFlowRepository(database),
@@ -715,6 +745,8 @@ def _build_etf_flow_ingestion_service(
         timezone_name=timezone_name,
         availability_hour=availability_hour,
         availability_minute=availability_minute,
+        watchlist_resolver=watchlist_resolver,
+        universe_label=universe_label,
     )
 
 
@@ -725,6 +757,65 @@ def _parse_optional_date(value: str | None, *, label: str) -> date | None:
         return date.fromisoformat(value)
     except ValueError as exc:
         raise typer.BadParameter(f"{label}必须是 YYYY-MM-DD") from exc
+
+
+@app.command("etf-universe-scan")
+def etf_universe_scan_command(
+    min_market_cap: float = typer.Option(
+        10_000_000_000,
+        min=0,
+        help="最低总市值，单位元；100亿元对应 10000000000",
+    ),
+    max_symbols: int | None = typer.Option(
+        None,
+        min=1,
+        help="最多输出多少只，默认输出所有达标 ETF",
+    ),
+    output_dir: Path | None = typer.Option(
+        None,
+        help="输出目录，默认 VNTDR_REPORT_DIR 或 reports",
+    ),
+    request_interval: float = typer.Option(0.0, min=0.0),
+    max_retries: int = typer.Option(3, min=0),
+    retry_backoff_seconds: float = typer.Option(1.0, min=0.0),
+    retry_jitter_seconds: float = typer.Option(0.25, min=0.0),
+) -> None:
+    """扫描全市场 ETF，筛选当前总市值达到阈值的标的。"""
+    settings = Settings.from_env()
+    provider = AkShareFundFlowProvider(
+        config=AkShareFlowConfig(
+            request_interval_seconds=request_interval,
+            max_retries=max_retries,
+            retry_backoff_seconds=retry_backoff_seconds,
+            retry_jitter_seconds=retry_jitter_seconds,
+        )
+    )
+    try:
+        universe = provider.fetch_etf_universe(
+            min_market_cap=min_market_cap,
+            max_symbols=max_symbols,
+        )
+    except (AkShareDataError, AkShareUnavailableError, ValueError) as exc:
+        typer.echo(f"ETF 市值筛选失败：{exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    destination = output_dir or settings.research.report_dir
+    destination.mkdir(parents=True, exist_ok=True)
+    output_path = destination / "etf_universe_market_cap.csv"
+    universe.to_csv(output_path, index=False)
+    typer.echo(
+        json.dumps(
+            {
+                "min_market_cap": min_market_cap,
+                "qualified_count": len(universe),
+                "retry_count": provider.retry_count,
+                "source": "akshare.fund_etf_spot_em",
+            },
+            ensure_ascii=False,
+        )
+    )
+    typer.echo(f"csv={output_path}")
+    if not universe.empty:
+        typer.echo(universe.to_string(index=False))
 
 
 @app.command("etf-flow-ingest")
@@ -750,6 +841,16 @@ def etf_flow_ingest_command(
     retry_jitter_seconds: float = typer.Option(
         0.25, min=0.0, help="重试退避的随机抖动秒数"
     ),
+    min_market_cap: float | None = typer.Option(
+        None,
+        min=0,
+        help="不传 symbols 时按总市值筛选 ETF，100亿元填写 10000000000",
+    ),
+    max_universe_size: int | None = typer.Option(
+        None,
+        min=1,
+        help="市值筛选模式最多采集多少只，默认全部达标标的",
+    ),
 ) -> None:
     """一次性拉取 ETF 观察池资金流并幂等写入 PostgreSQL。"""
     settings = Settings.from_env()
@@ -767,6 +868,8 @@ def etf_flow_ingest_command(
             max_retries=max_retries,
             retry_backoff_seconds=retry_backoff_seconds,
             retry_jitter_seconds=retry_jitter_seconds,
+            min_market_cap=min_market_cap,
+            max_universe_size=max_universe_size,
         )
         result = service.run(start_date=start_date, end_date=end_date)
     except (AkShareDataError, AkShareUnavailableError, ValueError) as exc:
@@ -796,6 +899,16 @@ def etf_flow_scheduler_command(
     max_retries: int = typer.Option(3, min=0),
     retry_backoff_seconds: float = typer.Option(1.0, min=0.0),
     retry_jitter_seconds: float = typer.Option(0.25, min=0.0),
+    min_market_cap: float | None = typer.Option(
+        None,
+        min=0,
+        help="不传 symbols 时按总市值筛选 ETF，100亿元填写 10000000000",
+    ),
+    max_universe_size: int | None = typer.Option(
+        None,
+        min=1,
+        help="市值筛选模式最多采集多少只，默认全部达标标的",
+    ),
     retry_until_success: bool = typer.Option(
         True,
         "--retry-until-success/--no-retry-until-success",
@@ -823,6 +936,8 @@ def etf_flow_scheduler_command(
             timezone_name=timezone_name,
             availability_hour=hour,
             availability_minute=minute,
+            min_market_cap=min_market_cap,
+            max_universe_size=max_universe_size,
         )
         scheduler = EtfFlowScheduler(
             ingestion_service=service,

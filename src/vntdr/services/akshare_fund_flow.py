@@ -404,6 +404,55 @@ class AkShareFundFlowProvider:
         self._retry_count = 0
         return self._fetch_one(normalized_symbol, market)
 
+    def fetch_etf_universe(
+        self,
+        *,
+        min_market_cap: float = 10_000_000_000,
+        max_symbols: int | None = None,
+    ) -> pd.DataFrame:
+        """Return ETFs whose current total market value passes the threshold.
+
+        ``fund_etf_spot_em`` exposes ``总市值`` in yuan.  This is a universe
+        discovery snapshot, not historical AUM, and should be refreshed before
+        a scheduled batch rather than treated as a backtest point-in-time fact.
+        """
+        if min_market_cap < 0:
+            raise ValueError("min_market_cap must be >= 0")
+        if max_symbols is not None and max_symbols < 1:
+            raise ValueError("max_symbols must be >= 1 when provided")
+        function = getattr(self.ak, "fund_etf_spot_em", None)
+        if function is None:
+            raise AkShareUnavailableError(
+                "Installed AkShare has no fund_etf_spot_em function"
+            )
+
+        self._retry_count = 0
+        frame = self._with_retries(function, label="etf:spot")
+        required = {"代码", "名称", "总市值"}
+        missing = sorted(required.difference(frame.columns))
+        if missing:
+            raise AkShareDataError(
+                "ETF spot response is missing columns: " + ", ".join(missing)
+            )
+        result = pd.DataFrame(
+            {
+                "symbol": frame["代码"].astype(str).str.extract(r"(\d{6})")[0],
+                "name": frame["名称"].astype(str).str.strip(),
+                "total_market_cap": pd.to_numeric(frame["总市值"], errors="coerce"),
+            }
+        )
+        result["market"] = result["symbol"].map(_market_for_code)
+        result = result.dropna(subset=["symbol", "total_market_cap"])
+        result = result[result["total_market_cap"] >= min_market_cap]
+        result = (
+            result.drop_duplicates("symbol")
+            .sort_values("total_market_cap", ascending=False)
+            .reset_index(drop=True)
+        )
+        if max_symbols is not None:
+            result = result.head(max_symbols).copy()
+        return result[["symbol", "name", "market", "total_market_cap"]]
+
     def fetch_month(
         self,
         *,

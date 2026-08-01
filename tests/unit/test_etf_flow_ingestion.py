@@ -90,6 +90,37 @@ def test_ingestion_upserts_rows_and_records_retry_count(tmp_path) -> None:
     assert runs[0]["status"] == "success"
 
 
+def test_ingestion_resolves_dynamic_universe_before_each_run(tmp_path) -> None:
+    database = Database(f"sqlite:///{tmp_path / 'dynamic-etf-flow.db'}")
+    database.create_schema()
+
+    class ResolvingProvider(FakeProvider):
+        def fetch_etf_universe(self, **_: object) -> pd.DataFrame:
+            return pd.DataFrame(
+                [{"symbol": "588200", "name": "科创芯片ETF", "market": "sh", "total_market_cap": 1e10}]
+            )
+
+    provider = ResolvingProvider()
+    service = EtfFlowIngestionService(
+        provider=provider,
+        repository=EtfMoneyFlowRepository(database),
+        watchlist=(EtfWatchTarget("510300", "sh"),),
+        watchlist_resolver=lambda: (EtfWatchTarget("588200", "sh"),),
+        universe_label="total_market_cap>=10000000000",
+        clock=lambda: datetime(2026, 7, 30, 8, tzinfo=timezone.utc),
+    )
+
+    result = service.run(
+        start_date=date(2026, 7, 29),
+        end_date=date(2026, 7, 30),
+        run_key="dynamic-run-1",
+    )
+
+    assert result["requested_count"] == 1
+    assert result["universe"] == "total_market_cap>=10000000000"
+    assert EtfMoneyFlowRepository(database).count_daily(symbol="588200") == 1
+
+
 def test_scheduler_marks_failed_task_retryable_and_queues_delayed_retry() -> None:
     class FailingService:
         def run(self) -> dict[str, object]:

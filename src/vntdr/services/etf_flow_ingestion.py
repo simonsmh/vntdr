@@ -88,6 +88,8 @@ class EtfFlowIngestionService:
         availability_hour: int = 16,
         availability_minute: int = 10,
         clock: Callable[[], datetime] | None = None,
+        watchlist_resolver: Callable[[], tuple[EtfWatchTarget, ...]] | None = None,
+        universe_label: str = "watchlist",
     ) -> None:
         if lookback_days < 1:
             raise ValueError("lookback_days must be >= 1")
@@ -106,6 +108,8 @@ class EtfFlowIngestionService:
         self.availability_hour = availability_hour
         self.availability_minute = availability_minute
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._watchlist_resolver = watchlist_resolver
+        self.universe_label = universe_label
 
     def _now(self) -> datetime:
         value = self._clock()
@@ -135,6 +139,12 @@ class EtfFlowIngestionService:
         if effective_start > effective_end:
             raise ValueError("start_date cannot be later than end_date")
 
+        watchlist = self.watchlist
+        if self._watchlist_resolver is not None:
+            watchlist = tuple(self._watchlist_resolver())
+            if not watchlist:
+                raise AkShareDataError("ETF universe resolver returned no symbols")
+
         key = run_key or (
             f"etf-flow-{started_at.astimezone(self._zone):%Y%m%d-%H%M%S}-"
             f"{uuid4().hex[:8]}"
@@ -142,14 +152,14 @@ class EtfFlowIngestionService:
         run_id = self.repository.create_run(
             run_key=key,
             started_at=started_at,
-            requested_count=len(self.watchlist),
+            requested_count=len(watchlist),
         )
         failures: list[dict[str, str]] = []
         successful_count = 0
         rows_seen = 0
         rows_inserted = 0
         retry_count = 0
-        for target in self.watchlist:
+        for target in watchlist:
             target_retry_count = 0
             try:
                 frame = self.provider.fetch_symbol_frame(
@@ -191,6 +201,8 @@ class EtfFlowIngestionService:
             "date_end": str(effective_end),
             "outcome": status,
             "task_status": task_status,
+            "universe": self.universe_label,
+            "universe_count": len(watchlist),
             "rows_seen": rows_seen,
             "rows_inserted": rows_inserted,
             "failures": failures,
@@ -213,7 +225,9 @@ class EtfFlowIngestionService:
             "retryable": failed_count > 0,
             "date_start": str(effective_start),
             "date_end": str(effective_end),
-            "requested_count": len(self.watchlist),
+            "universe": self.universe_label,
+            "universe_count": len(watchlist),
+            "requested_count": len(watchlist),
             "successful_count": successful_count,
             "failed_count": failed_count,
             "rows_seen": rows_seen,

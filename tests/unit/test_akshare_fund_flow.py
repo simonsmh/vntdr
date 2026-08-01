@@ -116,3 +116,24 @@ def test_fetch_one_retries_wrapper_and_fallback_then_succeeds(monkeypatch) -> No
     assert len(result) == 1
     assert sleep_calls == [0.5, 1.0]
     assert provider._retry_count == 2
+
+
+def test_fetch_etf_universe_filters_total_market_cap() -> None:
+    class FakeAkShare:
+        def fund_etf_spot_em(self) -> pd.DataFrame:
+            return pd.DataFrame(
+                [
+                    {"代码": "510300", "名称": "沪深300ETF", "总市值": 12_000_000_000},
+                    {"代码": "159845", "名称": "中证1000ETF", "总市值": 9_900_000_000},
+                    {"代码": "588200", "名称": "科创芯片ETF", "总市值": 10_000_000_000},
+                ]
+            )
+
+    provider = AkShareFundFlowProvider(
+        ak_module=FakeAkShare(),
+        config=AkShareFlowConfig(max_retries=0),
+    )
+    result = provider.fetch_etf_universe(min_market_cap=10_000_000_000)
+
+    assert list(result["symbol"]) == ["510300", "588200"]
+    assert list(result["market"]) == ["sh", "sh"]
