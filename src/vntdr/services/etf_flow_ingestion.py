@@ -1,4 +1,4 @@
-"""Scheduled ingestion of a small ETF money-flow watchlist."""
+"""Scheduled ingestion of an ETF money-flow universe."""
 from __future__ import annotations
 
 from collections.abc import Callable
@@ -31,6 +31,7 @@ class RetryableEtfFlowError(RuntimeError):
 class EtfWatchTarget:
     symbol: str
     market: str
+    name: str | None = None
 
     def __post_init__(self) -> None:
         normalized_symbol = str(self.symbol).strip().zfill(6)
@@ -42,13 +43,13 @@ class EtfWatchTarget:
 
 
 DEFAULT_ETF_WATCHLIST: tuple[EtfWatchTarget, ...] = (
-    EtfWatchTarget("588200", "sh"),
-    EtfWatchTarget("510300", "sh"),
-    EtfWatchTarget("588170", "sh"),
-    EtfWatchTarget("588080", "sh"),
-    EtfWatchTarget("159845", "sz"),
-    EtfWatchTarget("159941", "sz"),
-    EtfWatchTarget("512400", "sh"),
+    EtfWatchTarget("588200", "sh", "嘉实上证科创板芯片ETF"),
+    EtfWatchTarget("510300", "sh", "华泰柏瑞沪深300ETF"),
+    EtfWatchTarget("588170", "sh", "华夏上证科创板半导体材料设备主题ETF"),
+    EtfWatchTarget("588080", "sh", "易方达上证科创板50ETF"),
+    EtfWatchTarget("159845", "sz", "华夏中证1000ETF"),
+    EtfWatchTarget("159941", "sz", "广发纳指100ETF"),
+    EtfWatchTarget("512400", "sh", "南方有色金属ETF"),
 )
 
 
@@ -203,6 +204,10 @@ class EtfFlowIngestionService:
             "task_status": task_status,
             "universe": self.universe_label,
             "universe_count": len(watchlist),
+            "universe_symbols": [
+                {"symbol": target.symbol, "name": target.name}
+                for target in watchlist
+            ],
             "rows_seen": rows_seen,
             "rows_inserted": rows_inserted,
             "failures": failures,

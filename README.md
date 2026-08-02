@@ -25,9 +25,10 @@ uv run vntdr akshare-csi300-flow \
 
 ### ETF 观察池定时入库
 
-默认观察池为：`588200`、`510300`、`588170`、`588080`、`159845`、`159941`、`512400`。
-一次采集会将最近约 120 个自然日的可用资金流幂等写入 PostgreSQL；可用
-`VNTDR_ETF_WATCHLIST=588200:sh,510300:sh,159845:sz` 覆盖观察池。
+默认观察池是动态市值池：每次任务开始前扫描 AkShare ETF 行情，跟踪当前总市值不低于
+100 亿元的全部 ETF（本次扫描为 94 支）。一次采集会将最近约 120 个自然日的可用资金流幂等
+写入 PostgreSQL。若需要临时缩小范围，可用 `VNTDR_ETF_WATCHLIST=588200:sh,510300:sh`
+显式覆盖动态池。
 
 手动执行一次：
 
@@ -56,7 +57,7 @@ uv run vntdr etf-flow-scheduler \
 货币、债券、商品或跨境 ETF。若只跟踪股票 ETF，建议后续再增加名称/类型过滤，并通过
 `--max-universe-size` 控制公开接口请求量。
 
-启动 APScheduler 常驻任务（工作日 16:10，Asia/Shanghai）：
+启动 APScheduler 常驻任务（工作日 16:10，Asia/Shanghai；默认动态市值池）：
 
 ```bash
 uv run vntdr etf-flow-scheduler

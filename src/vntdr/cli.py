@@ -54,6 +54,9 @@ from vntdr.storage.repositories import (
     StrategyRepository,
 )
 
+
+DEFAULT_ETF_MIN_MARKET_CAP = 10_000_000_000
+
 app = typer.Typer(add_completion=False, no_args_is_help=True)
 
 
@@ -699,10 +702,13 @@ def _build_etf_flow_ingestion_service(
     min_market_cap: float | None = None,
     max_universe_size: int | None = None,
 ) -> EtfFlowIngestionService:
-    raw_watchlist = symbols or os.getenv("VNTDR_ETF_WATCHLIST")
+    configured_watchlist = os.getenv("VNTDR_ETF_WATCHLIST", "").strip()
+    raw_watchlist = symbols or configured_watchlist or None
     watchlist = parse_watchlist(raw_watchlist)
     if min_market_cap is None and os.getenv("VNTDR_ETF_MIN_MARKET_CAP"):
         min_market_cap = float(os.environ["VNTDR_ETF_MIN_MARKET_CAP"])
+    if min_market_cap is None and not symbols and not configured_watchlist:
+        min_market_cap = DEFAULT_ETF_MIN_MARKET_CAP
     if max_universe_size is None and os.getenv("VNTDR_ETF_MAX_UNIVERSE_SIZE"):
         max_universe_size = int(os.environ["VNTDR_ETF_MAX_UNIVERSE_SIZE"])
     database = Database(settings.database.dsn)
@@ -729,7 +735,7 @@ def _build_etf_flow_ingestion_service(
                 max_symbols=max_universe_size,
             )
             return tuple(
-                EtfWatchTarget(row.symbol, row.market)
+                EtfWatchTarget(row.symbol, row.market, row.name)
                 for row in universe.itertuples(index=False)
             )
 
@@ -823,8 +829,8 @@ def etf_flow_ingest_command(
     symbols: str | None = typer.Option(
         None,
         help=(
-            "观察池，格式 symbol:market,symbol:market；默认使用指定的 7 只 ETF，"
-            "也可用 VNTDR_ETF_WATCHLIST 覆盖"
+            "观察池，格式 symbol:market,symbol:market；留空时使用总市值≥100亿元的动态 ETF 池，"
+            "也可用 VNTDR_ETF_WATCHLIST 显式覆盖"
         ),
     ),
     start: str | None = typer.Option(None, "--from", help="开始日期 YYYY-MM-DD"),
@@ -844,7 +850,7 @@ def etf_flow_ingest_command(
     min_market_cap: float | None = typer.Option(
         None,
         min=0,
-        help="不传 symbols 时按总市值筛选 ETF，100亿元填写 10000000000",
+        help="不传 symbols 时按总市值筛选 ETF，默认 100 亿元（填写 0 可纳入全部）",
     ),
     max_universe_size: int | None = typer.Option(
         None,
@@ -902,7 +908,7 @@ def etf_flow_scheduler_command(
     min_market_cap: float | None = typer.Option(
         None,
         min=0,
-        help="不传 symbols 时按总市值筛选 ETF，100亿元填写 10000000000",
+        help="不传 symbols 时按总市值筛选 ETF，默认 100 亿元（填写 0 可纳入全部）",
     ),
     max_universe_size: int | None = typer.Option(
         None,
