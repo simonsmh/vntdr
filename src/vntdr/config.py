@@ -191,6 +191,7 @@ class Settings(BaseModel):
             "walk-forward": self._validate_database,
             "etf-flow-ingest": self._validate_database,
             "etf-flow-scheduler": self._validate_database,
+            "etf-factor-research": self._validate_database,
             "live": self._validate_live,
         }
         validator = validators.get(command_name)

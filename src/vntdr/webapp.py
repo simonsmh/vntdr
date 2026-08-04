@@ -22,8 +22,10 @@ from vntdr.services.data_quality import assess_bars
 from vntdr.services.etf_flow_ingestion import (
     DEFAULT_ETF_WATCHLIST,
     EtfFlowIngestionService,
+    EtfWatchTarget,
     parse_watchlist,
 )
+from vntdr.services.etf_factor_model import EtfFactorModelConfig, run_etf_factor_model
 from vntdr.services.history import HistorySyncService, OkxHistoryClient
 from vntdr.services.research import ResearchService
 from vntdr.services.tradingview_history import TradingViewHistoryClient
@@ -413,6 +415,7 @@ def _get_config_service():
 # ── ETF 资金流面板 ───────────────────────────────────────────────────
 
 _ETF_ZONE = ZoneInfo("Asia/Shanghai")
+_ETF_DEFAULT_LOOKBACK_DAYS = 60
 
 ETF_DISPLAY_NAMES = {
     "588200": "嘉实上证科创板芯片ETF",
@@ -423,6 +426,11 @@ ETF_DISPLAY_NAMES = {
     "159941": "广发纳指100ETF",
     "512400": "南方有色金属ETF",
 }
+
+_ETF_TIMING_COLUMNS = [
+    "信号日", "标的代码", "标的名称", "收盘价", "主力净流入(亿元)",
+    "3日累计流入(亿元)", "MA5", "量比", "评分", "估算参考价", "估算观察区间", "估算时机", "依据",
+]
 
 
 def _etf_name(symbol: Any, name_map: dict[str, str] | None = None) -> str:
@@ -493,12 +501,218 @@ def _format_etf_timestamp(value: Any) -> str:
     return str(value)
 
 
+def _etf_timing_candidates(
+    rows: pd.DataFrame,
+    *,
+    symbol: str | None = None,
+    name_map: dict[str, str] | None = None,
+) -> pd.DataFrame:
+    """Estimate closed-day buy-watch points from the displayed flow window.
+
+    This is deliberately a ranking heuristic, not an order signal.  A point
+    is only eligible after the close and is described as a next-session
+    observation point to preserve the panel's no-future-data boundary.
+    """
+    if rows.empty:
+        return pd.DataFrame(columns=_ETF_TIMING_COLUMNS)
+    required = {"trade_date", "main_net_inflow", "close_price"}
+    if not required.issubset(rows.columns):
+        return pd.DataFrame(columns=_ETF_TIMING_COLUMNS)
+    candidates: list[list[Any]] = []
+    working = rows.copy()
+    if symbol:
+        working = working[working["symbol"] == str(symbol).zfill(6)]
+    if working.empty:
+        return pd.DataFrame(columns=_ETF_TIMING_COLUMNS)
+    for current_symbol, group in working.groupby("symbol", sort=True):
+        group = group.sort_values("trade_date").copy()
+        group["close_price"] = pd.to_numeric(group["close_price"], errors="coerce")
+        group["main_net_inflow"] = pd.to_numeric(group["main_net_inflow"], errors="coerce")
+        for column in ("open_price", "volume"):
+            if column not in group:
+                group[column] = pd.NA
+            group[column] = pd.to_numeric(group[column], errors="coerce")
+        group = group.dropna(subset=["trade_date", "close_price", "main_net_inflow"])
+        if group.empty:
+            continue
+
+        group["ma5"] = group["close_price"].rolling(5, min_periods=3).mean()
+        group["flow3"] = group["main_net_inflow"].rolling(3, min_periods=1).sum()
+        prior_volume = group["volume"].rolling(5, min_periods=3).mean().shift(1)
+        group["volume_ratio"] = group["volume"] / prior_volume
+        group["flow_mean5"] = group["main_net_inflow"].rolling(5, min_periods=3).mean()
+
+        for _index, row in group.iterrows():
+            close = float(row["close_price"])
+            main = float(row["main_net_inflow"])
+            flow3 = float(row["flow3"])
+            ma5 = row["ma5"]
+            volume_ratio = row["volume_ratio"]
+            score = 0
+            reasons: list[str] = []
+            if main > 0:
+                score += 25
+                reasons.append("当日主力净流入")
+            if flow3 > 0:
+                score += 25
+                reasons.append("3日累计净流入")
+            if pd.notna(row["flow_mean5"]) and main > float(row["flow_mean5"]):
+                score += 15
+                reasons.append("资金流较5日均值改善")
+            if pd.notna(ma5) and close >= float(ma5) and close <= float(ma5) * 1.03:
+                score += 20
+                reasons.append("站上MA5且未明显追高")
+            if pd.notna(volume_ratio) and float(volume_ratio) >= 1.1:
+                score += 10
+                reasons.append("成交量放大")
+            if pd.notna(row["open_price"]) and close >= float(row["open_price"]):
+                score += 5
+                reasons.append("收阳")
+            if score < 60:
+                continue
+            anchor = float(ma5) if pd.notna(ma5) else close
+            # Keep both the current close and the MA5 reference inside the
+            # displayed observation band; this is a pullback/watch range, not a
+            # precise fill-price promise.
+            lower = min(close, anchor) * 0.995
+            upper = max(close, anchor) * 1.005
+            candidates.append(
+                [
+                    row["trade_date"].date(),
+                    str(current_symbol).zfill(6),
+                    _etf_name(current_symbol, name_map),
+                    round(close, 4),
+                    round(main / 100_000_000, 4),
+                    round(flow3 / 100_000_000, 4),
+                    round(float(ma5), 4) if pd.notna(ma5) else None,
+                    round(float(volume_ratio), 4) if pd.notna(volume_ratio) else None,
+                    score,
+                    round(anchor, 4),
+                    f"{lower:.4f}–{upper:.4f}",
+                    "下一交易日开盘后，回踩区间内且资金未转负再观察",
+                    "；".join(reasons),
+                ]
+            )
+    result = pd.DataFrame(candidates, columns=_ETF_TIMING_COLUMNS)
+    if result.empty:
+        return result
+    result = result.sort_values(["信号日", "评分"], ascending=[False, False])
+    if not symbol:
+        # The unfiltered panel shows one latest candidate per ETF so the
+        # overview remains readable; selecting a symbol reveals its full list.
+        result = result.drop_duplicates("标的代码", keep="first")
+    return result.reset_index(drop=True)
+
+
+def _etf_exit_candidates(
+    rows: pd.DataFrame,
+    *,
+    symbol: str | None = None,
+    name_map: dict[str, str] | None = None,
+) -> pd.DataFrame:
+    """Estimate closed-day sell/reduction watch points for held ETFs.
+
+    This is an exit-observation heuristic for an existing long position.  It
+    does not open shorts or submit orders: the close is evaluated after the
+    market close and the next session is only a place to observe a possible
+    reduction when selling pressure persists.
+    """
+    if rows.empty:
+        return pd.DataFrame(columns=_ETF_TIMING_COLUMNS)
+    required = {"trade_date", "main_net_inflow", "close_price"}
+    if not required.issubset(rows.columns):
+        return pd.DataFrame(columns=_ETF_TIMING_COLUMNS)
+    working = rows.copy()
+    if symbol:
+        working = working[working["symbol"] == str(symbol).zfill(6)]
+    if working.empty:
+        return pd.DataFrame(columns=_ETF_TIMING_COLUMNS)
+
+    candidates: list[list[Any]] = []
+    for current_symbol, group in working.groupby("symbol", sort=True):
+        group = group.sort_values("trade_date").copy()
+        group["close_price"] = pd.to_numeric(group["close_price"], errors="coerce")
+        group["main_net_inflow"] = pd.to_numeric(group["main_net_inflow"], errors="coerce")
+        for column in ("open_price", "volume"):
+            if column not in group:
+                group[column] = pd.NA
+            group[column] = pd.to_numeric(group[column], errors="coerce")
+        group = group.dropna(subset=["trade_date", "close_price", "main_net_inflow"])
+        if group.empty:
+            continue
+
+        group["ma5"] = group["close_price"].rolling(5, min_periods=3).mean()
+        group["flow3"] = group["main_net_inflow"].rolling(3, min_periods=1).sum()
+        prior_volume = group["volume"].rolling(5, min_periods=3).mean().shift(1)
+        group["volume_ratio"] = group["volume"] / prior_volume
+        group["flow_mean5"] = group["main_net_inflow"].rolling(5, min_periods=3).mean()
+
+        for _index, row in group.iterrows():
+            close = float(row["close_price"])
+            main = float(row["main_net_inflow"])
+            flow3 = float(row["flow3"])
+            ma5 = row["ma5"]
+            volume_ratio = row["volume_ratio"]
+            score = 0
+            reasons: list[str] = []
+            if main < 0:
+                score += 30
+                reasons.append("当日主力净流出")
+            if flow3 < 0:
+                score += 25
+                reasons.append("3日累计净流出")
+            if pd.notna(row["flow_mean5"]) and main < float(row["flow_mean5"]):
+                score += 15
+                reasons.append("资金流较5日均值转弱")
+            if pd.notna(ma5) and close < float(ma5):
+                score += 20
+                reasons.append("收盘跌破MA5")
+            if pd.notna(volume_ratio) and float(volume_ratio) >= 1.1:
+                score += 10
+                reasons.append("放量下行风险")
+            if pd.notna(row["open_price"]) and close < float(row["open_price"]):
+                score += 5
+                reasons.append("收阴")
+            if score < 60:
+                continue
+
+            anchor = float(ma5) if pd.notna(ma5) else close
+            lower = min(close, anchor) * 0.995
+            upper = max(close, anchor) * 1.005
+            candidates.append(
+                [
+                    row["trade_date"].date(),
+                    str(current_symbol).zfill(6),
+                    _etf_name(current_symbol, name_map),
+                    round(close, 4),
+                    round(main / 100_000_000, 4),
+                    round(flow3 / 100_000_000, 4),
+                    round(float(ma5), 4) if pd.notna(ma5) else None,
+                    round(float(volume_ratio), 4) if pd.notna(volume_ratio) else None,
+                    score,
+                    round(anchor, 4),
+                    f"{lower:.4f}–{upper:.4f}",
+                    "下一交易日开盘后，若资金仍偏弱，反弹至区间可观察卖出/减仓",
+                    "；".join(reasons),
+                ]
+            )
+
+    result = pd.DataFrame(candidates, columns=_ETF_TIMING_COLUMNS)
+    if result.empty:
+        return result
+    result = result.sort_values(["信号日", "评分"], ascending=[False, False])
+    if not symbol:
+        result = result.drop_duplicates("标的代码", keep="first")
+    return result.reset_index(drop=True)
+
+
 def _etf_display_frames(
     rows: list[dict[str, Any]],
     runs: list[dict[str, Any]],
     selected_symbol: str | None = None,
     name_map: dict[str, str] | None = None,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, go.Figure]:
+    trade_day_limit: int | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, go.Figure, pd.DataFrame, pd.DataFrame]:
     columns = [
         "标的代码", "标的名称", "市场", "观测天数", "主力累计净流入", "主力正流入天数",
         "主力正流入占比", "最新主力净流入", "最新主力净流入率", "最新收盘价",
@@ -506,13 +720,16 @@ def _etf_display_frames(
     ]
     daily_columns = [
         "交易日", "标的代码", "标的名称", "市场", "主力净流入", "主力净流入率", "超大单净流入",
-        "大单净流入", "大单净流入率", "收盘价", "涨跌幅", "可用时间", "抓取时间", "重试次数",
+        "大单净流入", "大单净流入率", "开盘价", "最高价", "最低价", "收盘价", "成交量", "成交额",
+        "涨跌幅", "可用时间", "抓取时间", "重试次数",
     ]
     run_columns = [
         "运行 ID", "状态", "开始时间", "结束时间", "请求数", "成功数", "失败数", "重试次数", "详情",
     ]
     if not rows:
         empty = pd.DataFrame(columns=daily_columns)
+        timing = pd.DataFrame(columns=_ETF_TIMING_COLUMNS)
+        exit_timing = pd.DataFrame(columns=_ETF_TIMING_COLUMNS)
         run_rows = [
             [
                 run.get("run_id"), run.get("status", ""),
@@ -524,11 +741,22 @@ def _etf_display_frames(
             ]
             for run in runs
         ]
-        return pd.DataFrame(columns=columns), empty, pd.DataFrame(run_rows, columns=run_columns), go.Figure()
+        return (
+            pd.DataFrame(columns=columns),
+            empty,
+            pd.DataFrame(run_rows, columns=run_columns),
+            go.Figure(),
+            timing,
+            exit_timing,
+        )
 
     raw = pd.DataFrame(rows)
     raw["trade_date"] = pd.to_datetime(raw["trade_date"], errors="coerce")
     raw = raw.dropna(subset=["trade_date"]).sort_values(["symbol", "trade_date"])
+    if trade_day_limit and trade_day_limit > 0:
+        trade_dates = sorted(raw["trade_date"].dt.date.unique())
+        if len(trade_dates) > trade_day_limit:
+            raw = raw[raw["trade_date"].dt.date.isin(trade_dates[-trade_day_limit:])]
     summary_rows: list[list[Any]] = []
     for symbol, group in raw.groupby("symbol", sort=True):
         latest = group.iloc[-1]
@@ -560,16 +788,31 @@ def _etf_display_frames(
     display_raw = raw
     if selected_symbol:
         display_raw = raw[raw["symbol"] == str(selected_symbol).zfill(6)]
+    timing = _etf_timing_candidates(
+        raw,
+        symbol=selected_symbol,
+        name_map=name_map,
+    )
+    exit_timing = _etf_exit_candidates(
+        raw,
+        symbol=selected_symbol,
+        name_map=name_map,
+    )
     daily = display_raw.rename(columns={
         "trade_date": "交易日", "symbol": "标的代码", "market": "市场",
         "main_net_inflow": "主力净流入", "main_inflow_ratio": "主力净流入率",
         "extra_large_net_inflow": "超大单净流入", "large_net_inflow": "大单净流入",
         "large_inflow_ratio": "大单净流入率", "close_price": "收盘价", "pct_change": "涨跌幅",
+        "open_price": "开盘价", "high_price": "最高价", "low_price": "最低价",
+        "volume": "成交量", "turnover": "成交额",
         "available_at": "可用时间", "fetched_at": "抓取时间", "retry_count": "重试次数",
     })
     daily.insert(2, "标的名称", daily["标的代码"].map(lambda value: _etf_name(value, name_map)))
     daily["交易日"] = daily["交易日"].dt.date
-    for column in ("主力净流入", "主力净流入率", "超大单净流入", "大单净流入", "大单净流入率", "收盘价", "涨跌幅"):
+    for column in (
+        "主力净流入", "主力净流入率", "超大单净流入", "大单净流入", "大单净流入率",
+        "开盘价", "最高价", "最低价", "收盘价", "成交量", "成交额", "涨跌幅",
+    ):
         daily[column] = pd.to_numeric(daily[column], errors="coerce").round(4)
     daily["可用时间"] = daily["可用时间"].map(_format_etf_timestamp)
     daily["抓取时间"] = daily["抓取时间"].map(_format_etf_timestamp)
@@ -587,23 +830,211 @@ def _etf_display_frames(
         ])
     runs_df = pd.DataFrame(run_rows, columns=run_columns)
 
-    chart = go.Figure()
-    for symbol, group in display_raw.groupby("symbol", sort=True):
-        chart.add_trace(go.Scatter(
-            x=group["trade_date"], y=group["main_net_inflow"],
-            mode="lines+markers", name=f"{symbol} · {_etf_name(symbol, name_map)}",
-        ))
-    chart.add_hline(y=0, line_dash="dot", line_color="#888")
-    chart.update_layout(
-        title=(
-            "观察池主力净流入趋势（数据库已入库数据）"
-            if not selected_symbol else f"{selected_symbol} · {_etf_name(selected_symbol, name_map)} 主力净流入趋势"
+    if selected_symbol and not display_raw.empty:
+        group = display_raw.sort_values("trade_date")
+        has_candles = all(
+            column in group and group[column].notna().any()
+            for column in ("open_price", "high_price", "low_price", "close_price")
+        )
+        if has_candles:
+            chart = make_subplots(
+                rows=2,
+                cols=1,
+                shared_xaxes=True,
+                vertical_spacing=0.06,
+                row_heights=[0.66, 0.34],
+                subplot_titles=("日线K线与候选观察点", "主力流入 / 流出（亿元）"),
+            )
+            chart.add_trace(
+                go.Candlestick(
+                    x=group["trade_date"],
+                    open=group["open_price"],
+                    high=group["high_price"],
+                    low=group["low_price"],
+                    close=group["close_price"],
+                    name="K线",
+                    increasing_line_color="#ef5350",
+                    decreasing_line_color="#26a69a",
+                ),
+                row=1,
+                col=1,
+            )
+            ma5 = group["close_price"].rolling(5, min_periods=3).mean()
+            chart.add_trace(
+                go.Scatter(
+                    x=group["trade_date"], y=ma5, mode="lines", name="MA5",
+                    line=dict(color="#f6c85f", width=1.4),
+                ),
+                row=1,
+                col=1,
+            )
+            if not timing.empty:
+                chart.add_trace(
+                    go.Scatter(
+                        x=pd.to_datetime(timing["信号日"]),
+                        y=timing["收盘价"],
+                        mode="markers",
+                        name="买入观察点",
+                        marker=dict(symbol="triangle-up", size=12, color="#00d084"),
+                        customdata=timing[["评分", "依据"]],
+                        hovertemplate="%{x|%Y-%m-%d}<br>评分=%{customdata[0]}<br>%{customdata[1]}<extra></extra>",
+                    ),
+                    row=1,
+                    col=1,
+                )
+            if not exit_timing.empty:
+                chart.add_trace(
+                    go.Scatter(
+                        x=pd.to_datetime(exit_timing["信号日"]),
+                        y=exit_timing["收盘价"],
+                        mode="markers",
+                        name="卖出/减仓观察点",
+                        marker=dict(symbol="triangle-down", size=12, color="#ff6b6b"),
+                        customdata=exit_timing[["评分", "依据"]],
+                        hovertemplate="%{x|%Y-%m-%d}<br>评分=%{customdata[0]}<br>%{customdata[1]}<extra></extra>",
+                    ),
+                    row=1,
+                    col=1,
+                )
+            main_yi = pd.to_numeric(group["main_net_inflow"], errors="coerce") / 100_000_000
+            inflow = main_yi.clip(lower=0)
+            outflow = main_yi.clip(upper=0)
+            chart.add_trace(
+                go.Scatter(
+                    x=group["trade_date"], y=inflow, mode="lines+markers", name="资金流入",
+                    line=dict(color="#ef5350", width=2),
+                ),
+                row=2,
+                col=1,
+            )
+            chart.add_trace(
+                go.Scatter(
+                    x=group["trade_date"], y=outflow, mode="lines+markers", name="资金流出",
+                    line=dict(color="#26a69a", width=2),
+                ),
+                row=2,
+                col=1,
+            )
+            chart.add_trace(
+                go.Scatter(
+                    x=group["trade_date"], y=main_yi, mode="lines", name="主力净流入",
+                    line=dict(color="#b9c2cc", dash="dot", width=1),
+                ),
+                row=2,
+                col=1,
+            )
+            chart.add_hline(y=0, line_dash="dot", line_color="#888", row=2, col=1)
+            chart.update_layout(
+                title=f"{selected_symbol} · {_etf_name(selected_symbol, name_map)}：K线与资金流",
+                height=620,
+                template="plotly_dark",
+                hovermode="x unified",
+                xaxis_rangeslider_visible=False,
+                margin=dict(l=55, r=20, t=75, b=35),
+            )
+            chart.update_yaxes(title_text="价格", row=1, col=1)
+            chart.update_yaxes(title_text="亿元", row=2, col=1)
+        else:
+            chart = go.Figure()
+            chart.add_trace(
+                go.Scatter(
+                    x=group["trade_date"],
+                    y=pd.to_numeric(group["main_net_inflow"], errors="coerce") / 100_000_000,
+                    mode="lines+markers",
+                    name="主力净流入（亿元）",
+                )
+            )
+            chart.add_hline(y=0, line_dash="dot", line_color="#888")
+            chart.update_layout(
+                title=f"{selected_symbol} · {_etf_name(selected_symbol, name_map)} 主力净流入趋势（缺少OHLCV）",
+                height=420, template="plotly_dark", hovermode="x unified",
+                xaxis_title="交易日", yaxis_title="亿元",
+                margin=dict(l=55, r=20, t=55, b=35),
+            )
+    else:
+        chart = go.Figure()
+        for symbol, group in display_raw.groupby("symbol", sort=True):
+            chart.add_trace(go.Scatter(
+                x=group["trade_date"],
+                y=pd.to_numeric(group["main_net_inflow"], errors="coerce") / 100_000_000,
+                mode="lines+markers", name=f"{symbol} · {_etf_name(symbol, name_map)}",
+            ))
+        chart.add_hline(y=0, line_dash="dot", line_color="#888")
+        chart.update_layout(
+            title="观察池主力净流入趋势（选择单只 ETF 查看K线与买入/卖出观察点）",
+            height=420, template="plotly_dark", hovermode="x unified",
+            xaxis_title="交易日", yaxis_title="主力净流入（亿元）",
+            margin=dict(l=55, r=20, t=55, b=35),
+        )
+    return summary, daily, runs_df, chart, timing, exit_timing
+
+
+def _etf_factor_panel(
+    rows: list[dict[str, Any]],
+    *,
+    name_map: dict[str, str] | None = None,
+    selected_symbol: str | None = None,
+) -> tuple[str, pd.DataFrame]:
+    """Fit the research model for the panel and format latest scores."""
+
+    columns = [
+        "模型日期", "排名", "标的代码", "标的名称", "模型评分", "上涨概率", "趋势",
+        "主力流入率", "3日资金流(亿元)", "1日收益", "5日收益", "MA5偏离", "量比",
+    ]
+    result = run_etf_factor_model(
+        rows,
+        config=EtfFactorModelConfig(
+            horizon_days=3,
+            min_train_days=30,
+            test_days=10,
+            step_days=10,
+            top_k=10,
+            cost_rate=0.0015,
         ),
-        height=420, template="plotly_dark", hovermode="x unified",
-        xaxis_title="交易日", yaxis_title="主力净流入",
-        margin=dict(l=55, r=20, t=55, b=35),
     )
-    return summary, daily, runs_df, chart
+    metrics = result.metrics
+    status = (
+        f"**多因子模型：{result.status}** · 训练样本 {metrics.get('labeled_rows', 0)} 行 · "
+        f"样本外折 {metrics.get('fold_count', 0)} · 非重叠事件 {metrics.get('event_count', 0)} · "
+        f"模型复合收益 {metrics.get('model_compounded_return', 0.0):.2%} · "
+        f"全市场基准 {metrics.get('benchmark_compounded_return', 0.0):.2%} · "
+        f"超额 {metrics.get('excess_mean_net_return', 0.0):.2%}"
+    )
+    if result.warnings:
+        status += "\n\n⚠️ " + "；".join(result.warnings)
+    latest = result.latest_scores.copy()
+    if latest.empty:
+        return status, pd.DataFrame(columns=columns)
+    if selected_symbol:
+        latest = latest[latest["symbol"] == str(selected_symbol).zfill(6)]
+    latest = latest.rename(
+        columns={
+            "trade_date": "模型日期",
+            "rank": "排名",
+            "symbol": "标的代码",
+            "model_score": "模型评分",
+            "model_probability": "上涨概率",
+            "trend": "趋势",
+            "main_flow_ratio": "主力流入率",
+            "main_flow_3d_100m": "3日资金流(亿元)",
+            "return_1d": "1日收益",
+            "return_5d": "5日收益",
+            "close_ma5_gap": "MA5偏离",
+            "volume_ratio_5d": "量比",
+        }
+    )
+    latest.insert(
+        3,
+        "标的名称",
+        latest["标的代码"].map(lambda value: _etf_name(value, name_map)),
+    )
+    latest["模型日期"] = pd.to_datetime(latest["模型日期"], errors="coerce").dt.date
+    for column in (
+        "模型评分", "上涨概率", "主力流入率", "3日资金流(亿元)", "1日收益",
+        "5日收益", "MA5偏离", "量比",
+    ):
+        latest[column] = pd.to_numeric(latest[column], errors="coerce").round(4)
+    return status, latest[columns].reset_index(drop=True)
 
 
 def _load_etf_panel(
@@ -615,10 +1046,19 @@ def _load_etf_panel(
     try:
         targets = parse_watchlist(watchlist_text) if watchlist_text.strip() else None
     except ValueError as exc:
-        return f"❌ 观察池格式错误：{exc}", *_etf_display_frames([], []), gr.update()
-    days = max(1, int(lookback_days or 30))
+        return (
+            f"❌ 观察池格式错误：{exc}",
+            *_etf_display_frames([], []),
+            "多因子模型：观察池格式错误",
+            pd.DataFrame(),
+            gr.update(),
+        )
+    days = max(1, int(lookback_days or _ETF_DEFAULT_LOOKBACK_DAYS))
     end_date = _etf_today()
-    start_date = end_date - timedelta(days=days - 1)
+    # ``days`` is a trading-day target for the UI.  Read a wider calendar
+    # window first, then trim to the latest distinct exchange dates in the
+    # display helper so weekends and holidays do not shorten the chart.
+    start_date = end_date - timedelta(days=max(days * 2, days) - 1)
     repository = _etf_repository()
     rows = repository.fetch_daily(
         symbols=[target.symbol for target in targets] if targets else None,
@@ -626,9 +1066,38 @@ def _load_etf_panel(
         end_date=end_date,
     )
     runs = repository.fetch_latest_runs(limit=20)
+    if targets is None:
+        # The database keeps historical snapshots so that older reports remain
+        # reproducible.  The unfiltered dashboard, however, represents the
+        # latest successful dynamic market-cap universe rather than every
+        # symbol ever observed.
+        latest_dynamic = next(
+            (
+                run
+                for run in runs
+                if run.get("status") == "success"
+                and str((run.get("details") or {}).get("universe", "")).startswith(
+                    "total_market_cap"
+                )
+                and (run.get("details") or {}).get("universe_symbols")
+            ),
+            None,
+        )
+        if latest_dynamic is not None:
+            dynamic_symbols = {
+                str(item.get("symbol", "")).zfill(6)
+                for item in (latest_dynamic.get("details") or {}).get("universe_symbols", [])
+                if item.get("symbol")
+            }
+            rows = [row for row in rows if str(row.get("symbol", "")).zfill(6) in dynamic_symbols]
     name_map = _etf_name_map_from_runs(runs)
-    summary, daily, runs_df, chart = _etf_display_frames(
-        rows, runs, selected_symbol, name_map
+    factor_status, factor_table = _etf_factor_panel(
+        rows,
+        name_map=name_map,
+        selected_symbol=selected_symbol,
+    )
+    summary, daily, runs_df, chart, timing, exit_timing = _etf_display_frames(
+        rows, runs, selected_symbol, name_map, trade_day_limit=days
     )
     symbols = summary["标的代码"].astype(str).tolist() if not summary.empty else list(name_map)
     choices = _etf_filter_choice_pairs(watchlist_text, symbols=symbols, name_map=name_map)
@@ -640,12 +1109,21 @@ def _load_etf_panel(
         status = "ℹ️ 数据库暂无观察池记录，请点击“立即采集并入库”，或等待 APScheduler 定时任务。"
     if runs:
         latest = runs[0]
+        if latest.get("details", {}).get("outcome") == "interrupted":
+            superseded_id = latest.get("details", {}).get("superseded_by_run_id")
+            latest = next(
+                (run for run in runs if run.get("run_id") == superseded_id),
+                latest,
+            )
         status += f" 最近任务：{latest.get('status', '-')}（{_format_etf_timestamp(latest.get('started_at'))}）。"
     if selected_symbol:
         status += f" 当前明细筛选：{selected_symbol} · {_etf_name(selected_symbol, name_map)}。"
     universe_text = "动态市值池" if not watchlist_text.strip() else "自定义观察池"
     status += f" 当前范围：{universe_text}。"
-    return status, summary, daily, runs_df, chart, filter_update
+    return (
+        status, summary, daily, runs_df, chart, timing, exit_timing,
+        factor_status, factor_table, filter_update,
+    )
 
 
 def _ingest_etf_panel(
@@ -657,10 +1135,16 @@ def _ingest_etf_panel(
     try:
         targets = parse_watchlist(watchlist_text) if watchlist_text.strip() else DEFAULT_ETF_WATCHLIST
     except ValueError as exc:
-        return f"❌ 观察池格式错误：{exc}", *_etf_display_frames([], []), gr.update()
-    days = max(1, int(lookback_days or 30))
+        return (
+            f"❌ 观察池格式错误：{exc}",
+            *_etf_display_frames([], []),
+            "多因子模型：观察池格式错误",
+            pd.DataFrame(),
+            gr.update(),
+        )
+    days = max(1, int(lookback_days or _ETF_DEFAULT_LOOKBACK_DAYS))
     end_date = _etf_today()
-    start_date = end_date - timedelta(days=days - 1)
+    start_date = end_date - timedelta(days=max(days * 2, days) - 1)
     settings = _get_config_service().settings
     database = Database(settings.database.dsn)
     database.create_schema()
@@ -684,7 +1168,7 @@ def _ingest_etf_panel(
                 max_symbols=max_symbols,
             )
             return tuple(
-                type(target)(row.symbol, row.market, row.name)
+                EtfWatchTarget(row.symbol, row.market, row.name)
                 for row in universe.itertuples(index=False)
             )
 
@@ -702,7 +1186,7 @@ def _ingest_etf_panel(
     except Exception as exc:  # noqa: BLE001 - surface source/config failures in the panel
         panel = _load_etf_panel(watchlist_text, days, selected_symbol)
         return f"❌ 本次采集未完成（可重试）：{exc}\n\n{panel[0]}", *panel[1:]
-    status, summary, daily, runs_df, chart, filter_update = _load_etf_panel(
+    status, summary, daily, runs_df, chart, timing, exit_timing, factor_status, factor_table, filter_update = _load_etf_panel(
         watchlist_text, days, selected_symbol
     )
     outcome = result.get("status", "unknown")
@@ -712,7 +1196,10 @@ def _ingest_etf_panel(
         f"{result.get('requested_count', len(targets))}，入库 {result.get('rows_inserted', 0)} 行，"
         f"重试 {result.get('retry_count', 0)} 次；任务状态：{task_status}。\n\n{status}"
     )
-    return status, summary, daily, runs_df, chart, filter_update
+    return (
+        status, summary, daily, runs_df, chart, timing, exit_timing,
+        factor_status, factor_table, filter_update,
+    )
 
 
 def _get_target_parameters(target: dict[str, Any], cs: ConfigService) -> dict[str, Any]:
@@ -1322,13 +1809,13 @@ def main(port: int | None = None) -> None:
                         scale=4,
                     )
                     etf_lookback = gr.Number(
-                        label="面板回看天数", value=30, minimum=1, precision=0, scale=1,
+                        label="面板回看交易日", value=_ETF_DEFAULT_LOOKBACK_DAYS, minimum=1, precision=0, scale=1,
                     )
                 etf_symbol_filter = gr.Dropdown(
-                    label="日频明细按标的筛选",
-                    choices=_etf_filter_choice_pairs(_etf_default_watchlist_text()),
-                    value="",
-                    info="动态市值池会在刷新/采集后载入全部标的名称；明细和趋势图按此筛选。",
+                        label="日频明细按标的筛选",
+                        choices=_etf_filter_choice_pairs(_etf_default_watchlist_text()),
+                        value="",
+                        info="动态市值池会在刷新/采集后载入全部标的名称；选择单只 ETF 后显示K线、资金流入/流出和买入、卖出/减仓观察点。",
                 )
                 with gr.Row():
                     etf_refresh_btn = gr.Button("🔄 刷新数据库视图", variant="secondary")
@@ -1344,10 +1831,38 @@ def main(port: int | None = None) -> None:
                     interactive=False,
                 )
                 etf_trend_plot = gr.Plot(label="主力净流入趋势")
+                etf_timing_table = gr.Dataframe(
+                    headers=[
+                        "信号日", "标的代码", "标的名称", "收盘价", "主力净流入(亿元)",
+                        "3日累计流入(亿元)", "MA5", "量比", "评分", "估算参考价", "估算观察区间", "估算时机", "依据",
+                    ],
+                    label="买入时机估算（未筛选时显示各 ETF 最近候选；收盘确认，下一交易日观察）",
+                    interactive=False,
+                )
+                etf_exit_timing_table = gr.Dataframe(
+                    headers=[
+                        "信号日", "标的代码", "标的名称", "收盘价", "主力净流入(亿元)",
+                        "3日累计流入(亿元)", "MA5", "量比", "评分", "估算参考价", "估算观察区间", "估算时机", "依据",
+                    ],
+                    label="卖出/减仓时机估算（针对已有多头持仓；收盘确认，下一交易日观察）",
+                    interactive=False,
+                )
+                etf_factor_status = gr.Markdown(
+                    "多因子模型：尚未运行。模型仅用于样本外研究，不构成交易信号。"
+                )
+                etf_factor_table = gr.Dataframe(
+                    headers=[
+                        "模型日期", "排名", "标的代码", "标的名称", "模型评分", "上涨概率", "趋势",
+                        "主力流入率", "3日资金流(亿元)", "1日收益", "5日收益", "MA5偏离", "量比",
+                    ],
+                    label="多因子模型最新评分（研究用途）",
+                    interactive=False,
+                )
                 etf_daily_table = gr.Dataframe(
                     headers=[
                         "交易日", "标的代码", "标的名称", "市场", "主力净流入", "主力净流入率", "超大单净流入",
-                        "大单净流入", "大单净流入率", "收盘价", "涨跌幅", "可用时间", "抓取时间", "重试次数",
+                        "大单净流入", "大单净流入率", "开盘价", "最高价", "最低价", "收盘价", "成交量", "成交额",
+                        "涨跌幅", "可用时间", "抓取时间", "重试次数",
                     ],
                     label="日频资金流明细",
                     interactive=False,
@@ -2609,7 +3124,8 @@ def main(port: int | None = None) -> None:
         )
         etf_outputs = [
             etf_status, etf_summary_table, etf_daily_table, etf_runs_table,
-            etf_trend_plot, etf_symbol_filter,
+            etf_trend_plot, etf_timing_table, etf_exit_timing_table,
+            etf_factor_status, etf_factor_table, etf_symbol_filter,
         ]
         etf_refresh_btn.click(
             _load_etf_panel,
@@ -2618,6 +3134,14 @@ def main(port: int | None = None) -> None:
         )
         etf_ingest_btn.click(
             _ingest_etf_panel,
+            inputs=[etf_watchlist, etf_lookback, etf_symbol_filter],
+            outputs=etf_outputs,
+        )
+        # Selecting a symbol is itself a read-only filter action.  Refreshing
+        # or ingesting should not be required before the trend/K-line view
+        # follows the dropdown selection.
+        etf_symbol_filter.change(
+            _load_etf_panel,
             inputs=[etf_watchlist, etf_lookback, etf_symbol_filter],
             outputs=etf_outputs,
         )

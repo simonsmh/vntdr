@@ -118,6 +118,34 @@ def test_fetch_one_retries_wrapper_and_fallback_then_succeeds(monkeypatch) -> No
     assert provider._retry_count == 2
 
 
+def test_public_flow_fallback_accepts_mobile_h5_schema(monkeypatch) -> None:
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {
+                "data": {
+                    "klines": [
+                        "2026-07-31,100,10,20,30,40,1,2,3,4,5,4.15,1.2",
+                    ]
+                }
+            }
+
+    calls: list[str] = []
+
+    def fake_get(endpoint: str, **_: object) -> FakeResponse:
+        calls.append(endpoint)
+        return FakeResponse()
+
+    monkeypatch.setattr(akshare_fund_flow.httpx, "get", fake_get)
+    result = akshare_fund_flow._fetch_public_flow_frame("510300", "sh")
+
+    assert calls[0].endswith("getDBHistoryData")
+    assert result.loc[0, "主力净流入-净额"] == "100"
+    assert result.loc[0, "收盘价"] == "4.15"
+
+
 def test_fetch_etf_universe_filters_total_market_cap() -> None:
     class FakeAkShare:
         def fund_etf_spot_em(self) -> pd.DataFrame:
@@ -137,3 +165,90 @@ def test_fetch_etf_universe_filters_total_market_cap() -> None:
 
     assert list(result["symbol"]) == ["510300", "588200"]
     assert list(result["market"]) == ["sh", "sh"]
+
+
+def test_fetch_etf_price_frame_normalizes_ohlcv_and_date_window() -> None:
+    class FakeAkShare:
+        def fund_etf_hist_em(self, **kwargs: object) -> pd.DataFrame:
+            assert kwargs["symbol"] == "510300"
+            assert kwargs["period"] == "daily"
+            assert kwargs["start_date"] == "20260701"
+            assert kwargs["end_date"] == "20260731"
+            return pd.DataFrame(
+                [
+                    {
+                        "日期": "2026-06-30",
+                        "开盘": 4.0,
+                        "最高": 4.1,
+                        "最低": 3.9,
+                        "收盘": 4.05,
+                        "成交量": 100,
+                        "成交额": 200,
+                        "涨跌幅": 1.0,
+                    },
+                    {
+                        "日期": "2026-07-31",
+                        "开盘": 4.1,
+                        "最高": 4.2,
+                        "最低": 4.0,
+                        "收盘": 4.15,
+                        "成交量": 120,
+                        "成交额": 240,
+                        "涨跌幅": 2.0,
+                    },
+                ]
+            )
+
+    provider = AkShareFundFlowProvider(
+        ak_module=FakeAkShare(),
+        config=AkShareFlowConfig(max_retries=0),
+    )
+    result = provider.fetch_etf_price_frame(
+        symbol="510300",
+        market="sh",
+        start_date=date(2026, 7, 1),
+        end_date=date(2026, 7, 31),
+    )
+
+    assert list(result["trade_date"]) == [date(2026, 7, 31)]
+    assert result.iloc[0]["open_price"] == 4.1
+    assert result.iloc[0]["high_price"] == 4.2
+    assert result.iloc[0]["low_price"] == 4.0
+    assert result.iloc[0]["volume"] == 120
+
+
+def test_fetch_etf_price_frame_uses_public_fallback_after_wrapper_disconnect(monkeypatch) -> None:
+    class FlakyAkShare:
+        def fund_etf_hist_em(self, **_: object) -> pd.DataFrame:
+            raise ConnectionError("remote end closed connection")
+
+    monkeypatch.setattr(
+        akshare_fund_flow,
+        "_fetch_public_price_frame",
+        lambda symbol, market: pd.DataFrame(
+            [
+                {
+                    "trade_date": "2026-07-31",
+                    "open_price": "4.10",
+                    "high_price": "4.20",
+                    "low_price": "4.00",
+                    "close_price": "4.15",
+                    "volume": "120",
+                }
+            ]
+        ),
+    )
+    provider = AkShareFundFlowProvider(
+        ak_module=FlakyAkShare(),
+        config=AkShareFlowConfig(max_retries=0),
+    )
+
+    result = provider.fetch_etf_price_frame(
+        symbol="510300",
+        market="sh",
+        start_date=date(2026, 7, 1),
+        end_date=date(2026, 7, 31),
+    )
+
+    assert result.iloc[0]["close_price"] == 4.15
+    assert pd.isna(result.iloc[0]["turnover"])  # Sina fallback does not expose turnover.

@@ -167,7 +167,7 @@ class EtfFlowIngestionService:
                     symbol=target.symbol,
                     market=target.market,
                 )
-                target_retry_count = self.provider.retry_count
+                flow_retry_count = self.provider.retry_count
                 frame = frame[
                     (frame["trade_date"] >= effective_start)
                     & (frame["trade_date"] <= effective_end)
@@ -178,6 +178,52 @@ class EtfFlowIngestionService:
                         f"{effective_start} and {effective_end}"
                     )
                 frame = frame.copy()
+
+                # OHLCV is optional for custom/test providers, but the
+                # production AkShare provider exposes it so the Gradio panel
+                # can render candlesticks and timing candidates.  A price
+                # failure makes this target retryable instead of silently
+                # producing a flow-only row that cannot be charted.
+                price_fetcher = getattr(self.provider, "fetch_etf_price_frame", None)
+                price_retry_count = 0
+                if callable(price_fetcher):
+                    price_frame = price_fetcher(
+                        symbol=target.symbol,
+                        market=target.market,
+                        start_date=effective_start,
+                        end_date=effective_end,
+                    )
+                    price_retry_count = self.provider.retry_count
+                    if price_frame.empty:
+                        raise AkShareDataError(
+                            f"no ETF price rows for {target.symbol} between "
+                            f"{effective_start} and {effective_end}"
+                        )
+                    frame = frame.merge(
+                        price_frame.drop(columns=["symbol"], errors="ignore"),
+                        on="trade_date",
+                        how="left",
+                        suffixes=("", "_price"),
+                    )
+                    for column in (
+                        "open_price",
+                        "high_price",
+                        "low_price",
+                        "volume",
+                        "turnover",
+                        "turnover_rate",
+                    ):
+                        if column not in frame:
+                            frame[column] = None
+                    # The flow endpoint and price endpoint both expose close
+                    # and pct-change. Prefer the flow values when present and
+                    # fill gaps from the OHLCV source.
+                    for column in ("close_price", "pct_change"):
+                        price_column = f"{column}_price"
+                        if price_column in frame:
+                            frame[column] = frame[column].fillna(frame[price_column])
+                            frame = frame.drop(columns=[price_column])
+                target_retry_count = flow_retry_count + price_retry_count
                 frame["available_at"] = frame["trade_date"].map(self._availability_at)
                 rows_seen += len(frame)
                 rows_inserted += self.repository.upsert_daily(

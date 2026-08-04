@@ -121,6 +121,59 @@ def test_ingestion_resolves_dynamic_universe_before_each_run(tmp_path) -> None:
     assert EtfMoneyFlowRepository(database).count_daily(symbol="588200") == 1
 
 
+def test_ingestion_merges_optional_etf_ohlcv_for_panel_charts(tmp_path) -> None:
+    database = Database(f"sqlite:///{tmp_path / 'etf-ohlcv.db'}")
+    database.create_schema()
+
+    class PriceProvider(FakeProvider):
+        def fetch_etf_price_frame(
+            self,
+            *,
+            symbol: str,
+            market: str,
+            start_date: date,
+            end_date: date,
+        ) -> pd.DataFrame:
+            assert market == "sh"
+            assert start_date <= date(2026, 7, 29) <= end_date
+            self.retry_count = 0
+            return pd.DataFrame(
+                [
+                    {
+                        "trade_date": date(2026, 7, 29),
+                        "symbol": symbol,
+                        "open_price": 0.98,
+                        "high_price": 1.05,
+                        "low_price": 0.96,
+                        "close_price": 1.0,
+                        "volume": 12345.0,
+                        "turnover": 67890.0,
+                        "turnover_rate": 1.2,
+                    }
+                ]
+            )
+
+    service = EtfFlowIngestionService(
+        provider=PriceProvider(),
+        repository=EtfMoneyFlowRepository(database),
+        watchlist=(EtfWatchTarget("588200", "sh"),),
+        lookback_days=10,
+        clock=lambda: datetime(2026, 7, 30, 8, tzinfo=timezone.utc),
+    )
+    result = service.run(
+        start_date=date(2026, 7, 29),
+        end_date=date(2026, 7, 30),
+        run_key="ohlcv-run-1",
+    )
+
+    assert result["status"] == "success"
+    row = EtfMoneyFlowRepository(database).fetch_daily(symbols=["588200"])[0]
+    assert row["open_price"] == 0.98
+    assert row["high_price"] == 1.05
+    assert row["low_price"] == 0.96
+    assert row["volume"] == 12345.0
+
+
 def test_scheduler_marks_failed_task_retryable_and_queues_delayed_retry() -> None:
     class FailingService:
         def run(self) -> dict[str, object]:

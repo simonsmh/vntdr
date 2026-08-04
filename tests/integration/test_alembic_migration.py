@@ -28,6 +28,15 @@ def test_alembic_upgrade_creates_strategy_platform_tables(tmp_path) -> None:
         "etf_money_flow_daily",
         "etf_flow_ingestion_runs",
     } <= tables
+    columns = {column["name"] for column in inspect(create_engine(db_url)).get_columns("etf_money_flow_daily")}
+    assert {
+        "open_price",
+        "high_price",
+        "low_price",
+        "volume",
+        "turnover",
+        "turnover_rate",
+    } <= columns
 
 
 def test_entrypoint_stamps_complete_legacy_schema_before_upgrade(tmp_path) -> None:
@@ -47,4 +56,4 @@ def test_entrypoint_stamps_complete_legacy_schema_before_upgrade(tmp_path) -> No
     assert result.returncode == 0, result.stderr
     with create_engine(db_url).connect() as connection:
         version = connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
-    assert version == "20260730_03"
+    assert version == "20260803_04"

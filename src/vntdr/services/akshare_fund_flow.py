@@ -59,34 +59,17 @@ def _numeric(series: pd.Series) -> pd.Series:
 
 
 def _fetch_public_flow_frame(symbol: str, market: str) -> pd.DataFrame:
-    """Fallback for Eastmoney rejecting AkShare's timestamped request.
+    """Fetch public daily flow data when AkShare's wrapper disconnects.
 
-    This is the public endpoint used by AkShare's ``stock_individual_fund_flow``
-    implementation.  Keeping it here avoids silently changing the data source
-    while working around a transient anti-bot response from the wrapper call.
+    Eastmoney's mobile H5 endpoint is tried first because the desktop
+    ``push2his`` endpoint intermittently closes the connection without an HTTP
+    response in containers.  The desktop endpoint remains a same-source
+    fallback, so the provider does not silently switch the flow definition.
     """
     market_map = {"sh": 1, "sz": 0, "bj": 0}
     if market not in market_map:
         raise AkShareDataError(f"unsupported market: {market}")
-    response = httpx.get(
-        "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get",
-        params={
-            "lmt": "0",
-            "klt": "101",
-            "secid": f"{market_map[market]}.{symbol}",
-            "fields1": "f1,f2,f3,f7",
-            "fields2": ",".join(f"f{number}" for number in range(51, 66)),
-            "ut": "b2884a393a59ad64002292a3e90d46a5",
-        },
-        headers={"User-Agent": "Mozilla/5.0"},
-        timeout=20,
-    )
-    response.raise_for_status()
-    payload = response.json()
-    klines = ((payload.get("data") or {}).get("klines") or [])
-    if not klines:
-        raise AkShareDataError(f"empty public money-flow response for {symbol}")
-    columns = [
+    columns_13 = [
         "日期",
         "主力净流入-净额",
         "小单净流入-净额",
@@ -100,10 +83,151 @@ def _fetch_public_flow_frame(symbol: str, market: str) -> pd.DataFrame:
         "超大单净流入-净占比",
         "收盘价",
         "涨跌幅",
+    ]
+    columns_15 = [
+        *columns_13,
         "_unused_1",
         "_unused_2",
     ]
-    return pd.DataFrame([row.split(",") for row in klines], columns=columns)
+    attempts = [
+        (
+            "https://emdatah5.eastmoney.com/dc/ZJLX/getDBHistoryData",
+            {
+                "secid": f"{market_map[market]}.{symbol}",
+                "fields1": "f1,f2,f3",
+                "fields2": ",".join(f"f{number}" for number in range(51, 64)),
+                "ut": "",
+                "_": str(int(time.time() * 1000)),
+            },
+            {"User-Agent": "Mozilla/5.0", "Referer": "https://emdatah5.eastmoney.com/"},
+        ),
+        (
+            "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get",
+            {
+                "lmt": "0",
+                "klt": "101",
+                "secid": f"{market_map[market]}.{symbol}",
+                "fields1": "f1,f2,f3,f7",
+                "fields2": ",".join(f"f{number}" for number in range(51, 66)),
+                "ut": "b2884a393a59ad64002292a3e90d46a5",
+            },
+            {"User-Agent": "Mozilla/5.0"},
+        ),
+    ]
+    errors: list[str] = []
+    for endpoint, params, headers in attempts:
+        try:
+            response = httpx.get(endpoint, params=params, headers=headers, timeout=20)
+            response.raise_for_status()
+            payload = response.json()
+            klines = ((payload.get("data") or {}).get("klines") or [])
+            if not klines:
+                raise AkShareDataError("empty response")
+            rows = [row.split(",") for row in klines]
+            width = len(rows[0])
+            if width not in {13, 15} or any(len(row) != width for row in rows):
+                raise AkShareDataError(f"unexpected kline width: {width}")
+            return pd.DataFrame(rows, columns=columns_13 if width == 13 else columns_15)
+        except Exception as exc:  # noqa: BLE001 - try same-source endpoint next
+            errors.append(f"{endpoint}: {exc}")
+    raise AkShareDataError(
+        f"empty or unavailable public money-flow response for {symbol}: {' | '.join(errors)}"
+    )
+
+
+def _fetch_public_price_frame(symbol: str, market: str) -> pd.DataFrame:
+    """Fallback daily OHLCV source for intermittent Eastmoney disconnects.
+
+    ``fund_etf_hist_em`` normally supplies the candle data, but its Eastmoney
+    endpoint can close the connection before returning an HTTP response.  The
+    public Sina quote endpoint is used only as a transport fallback; it is
+    normalized into the same schema and remains behind this provider boundary.
+    Turnover is not exposed by that endpoint, so it is intentionally left
+    null instead of being estimated from volume.
+    """
+    market_prefix = {"sh": "sh", "sz": "sz"}.get(market)
+    if market_prefix is None:
+        raise AkShareDataError(f"unsupported market for public price fallback: {market}")
+    response = httpx.get(
+        "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+        "CN_MarketData.getKLineData",
+        params={
+            "symbol": f"{market_prefix}{str(symbol).strip().zfill(6)}",
+            "scale": "240",
+            "ma": "no",
+            "datalen": "120",
+        },
+        headers={"User-Agent": "Mozilla/5.0", "Referer": "https://finance.sina.com.cn/"},
+        timeout=20,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, list) or not payload:
+        raise AkShareDataError(f"empty public price response for {symbol}")
+    return pd.DataFrame(payload).rename(
+        columns={
+            "day": "trade_date",
+            "open": "open_price",
+            "high": "high_price",
+            "low": "low_price",
+            "close": "close_price",
+            "volume": "volume",
+        }
+    )
+
+
+def _normalize_price_frame(
+    frame: pd.DataFrame,
+    *,
+    symbol: str,
+    start_date: date,
+    end_date: date,
+) -> pd.DataFrame:
+    """Normalize AkShare/Sina daily price responses to the panel schema."""
+    required = {"trade_date", "open_price", "high_price", "low_price", "close_price", "volume"}
+    missing = sorted(required.difference(frame.columns))
+    if missing:
+        raise AkShareDataError(
+            f"ETF price response for {symbol} is missing columns: {', '.join(missing)}"
+        )
+    result = frame.copy()
+    result["trade_date"] = pd.to_datetime(result["trade_date"], errors="coerce").dt.date
+    for column in (
+        "open_price",
+        "high_price",
+        "low_price",
+        "close_price",
+        "volume",
+        "turnover",
+        "pct_change",
+        "turnover_rate",
+    ):
+        if column not in result:
+            result[column] = None
+        result[column] = _numeric(result[column])
+    result = result.dropna(subset=["trade_date", "close_price"])
+    result = result[
+        (result["trade_date"] >= start_date) & (result["trade_date"] <= end_date)
+    ]
+    if result.empty:
+        raise AkShareDataError(
+            f"no ETF price rows for {symbol} between {start_date} and {end_date}"
+        )
+    result["symbol"] = str(symbol).strip().zfill(6)
+    return result[
+        [
+            "trade_date",
+            "symbol",
+            "open_price",
+            "high_price",
+            "low_price",
+            "close_price",
+            "volume",
+            "turnover",
+            "turnover_rate",
+            "pct_change",
+        ]
+    ].sort_values("trade_date")
 
 
 def normalize_flow_frame(frame: pd.DataFrame, *, symbol: str) -> pd.DataFrame:
@@ -452,6 +576,76 @@ class AkShareFundFlowProvider:
         if max_symbols is not None:
             result = result.head(max_symbols).copy()
         return result[["symbol", "name", "market", "total_market_cap"]]
+
+    def fetch_etf_price_frame(
+        self,
+        *,
+        symbol: str,
+        market: str,
+        start_date: date,
+        end_date: date,
+    ) -> pd.DataFrame:
+        """Fetch daily OHLCV used to draw ETF candles and timing estimates.
+
+        ``fund_etf_hist_em`` is kept behind the same provider boundary as the
+        flow endpoint.  The flow API only exposes close/pct-change, while a
+        candlestick needs open/high/low and volume.  The date filter is applied
+        here so callers cannot accidentally mix a wider price window with the
+        requested flow window.
+        """
+        function = getattr(self.ak, "fund_etf_hist_em", None)
+        if function is None:
+            raise AkShareUnavailableError(
+                "Installed AkShare has no fund_etf_hist_em function"
+            )
+        normalized_symbol = str(symbol).strip().zfill(6)
+        if start_date > end_date:
+            raise ValueError("start_date cannot be later than end_date")
+
+        def _fetch_once() -> pd.DataFrame:
+            try:
+                frame = function(
+                    symbol=normalized_symbol,
+                    period="daily",
+                    start_date=start_date.strftime("%Y%m%d"),
+                    end_date=end_date.strftime("%Y%m%d"),
+                    adjust="",
+                )
+                frame = frame.rename(
+                    columns={
+                        "日期": "trade_date",
+                        "开盘": "open_price",
+                        "最高": "high_price",
+                        "最低": "low_price",
+                        "收盘": "close_price",
+                        "成交量": "volume",
+                        "成交额": "turnover",
+                        "涨跌幅": "pct_change",
+                        "换手率": "turnover_rate",
+                    }
+                )
+                return _normalize_price_frame(
+                    frame,
+                    symbol=normalized_symbol,
+                    start_date=start_date,
+                    end_date=end_date,
+                )
+            except Exception as exc:  # noqa: BLE001 - public wrapper can disconnect
+                try:
+                    fallback = _fetch_public_price_frame(normalized_symbol, market)
+                    return _normalize_price_frame(
+                        fallback,
+                        symbol=normalized_symbol,
+                        start_date=start_date,
+                        end_date=end_date,
+                    )
+                except Exception as fallback_exc:  # noqa: BLE001 - preserve both causes
+                    raise AkShareDataError(
+                        f"wrapper={exc}; public_fallback={fallback_exc}"
+                    ) from fallback_exc
+
+        self._retry_count = 0
+        return self._with_retries(_fetch_once, label=f"price:{normalized_symbol}")
 
     def fetch_month(
         self,

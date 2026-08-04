@@ -39,6 +39,7 @@ from vntdr.services.etf_flow_ingestion import (
     parse_watchlist,
 )
 from vntdr.services.etf_flow_scheduler import EtfFlowScheduler
+from vntdr.services.etf_factor_model import EtfFactorModelConfig, run_etf_factor_model
 from vntdr.services.governance import StrategyGovernanceService
 from vntdr.services.monitoring import MonitoringService
 from vntdr.services.portfolio_runtime import PortfolioRuntimeService
@@ -891,6 +892,73 @@ def etf_flow_ingest_command(
     typer.echo(f"summary_json={summary_path}")
     if result.get("retryable", False):
         raise typer.Exit(code=1)
+
+
+@app.command("etf-factor-research")
+def etf_factor_research_command(
+    symbols: str | None = typer.Option(
+        None,
+        help="观察池，格式 symbol:market,symbol:market；留空时使用数据库中已入库的 ETF",
+    ),
+    start: str | None = typer.Option(None, "--from", help="开始日期 YYYY-MM-DD"),
+    end: str | None = typer.Option(None, "--to", help="结束日期 YYYY-MM-DD，默认最新入库日期"),
+    horizon_days: int = typer.Option(3, min=1, help="从下一交易日开盘起持有的交易日数"),
+    min_train_days: int = typer.Option(30, min=5, help="扩展窗口最少训练交易日数"),
+    test_days: int = typer.Option(10, min=1, help="每个样本外折的交易日数"),
+    step_days: int = typer.Option(10, min=1, help="样本外折向前滚动步长"),
+    top_k: int = typer.Option(10, min=1, help="每个信号日按模型评分选取的 ETF 数量"),
+    cost_rate: float = typer.Option(0.0015, min=0.0, help="单次往返成本假设"),
+    output_dir: Path | None = typer.Option(None, help="输出目录，默认 VNTDR_REPORT_DIR 或 reports"),
+) -> None:
+    """用 ETF 资金流、价格和量价因子做样本外多因子排名研究。"""
+    settings = Settings.from_env()
+    settings.validate_for("etf-factor-research")
+    start_date = _parse_optional_date(start, label="开始日期")
+    end_date = _parse_optional_date(end, label="结束日期")
+    if start_date and end_date and start_date > end_date:
+        raise typer.BadParameter("开始日期不能晚于结束日期")
+    database = Database(settings.database.dsn)
+    database.create_schema()
+    repository = EtfMoneyFlowRepository(database)
+    parsed_symbols = parse_watchlist(symbols) if symbols else None
+    rows = repository.fetch_daily(
+        symbols=[target.symbol for target in parsed_symbols] if parsed_symbols else None,
+        start_date=start_date,
+        end_date=end_date,
+    )
+    result = run_etf_factor_model(
+        rows,
+        config=EtfFactorModelConfig(
+            horizon_days=horizon_days,
+            min_train_days=min_train_days,
+            test_days=test_days,
+            step_days=step_days,
+            top_k=top_k,
+            cost_rate=cost_rate,
+        ),
+    )
+    destination = output_dir or settings.research.report_dir
+    destination.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    prefix = destination / f"etf_factor_research_{stamp}"
+    result.latest_scores.to_csv(f"{prefix}_latest.csv", index=False)
+    result.fold_metrics.to_csv(f"{prefix}_folds.csv", index=False)
+    result.event_returns.to_csv(f"{prefix}_events.csv", index=False)
+    result.feature_importance.to_csv(f"{prefix}_features.csv", index=False)
+    summary = {
+        "status": result.status,
+        "metrics": result.metrics,
+        "warnings": result.warnings,
+        "latest_csv": f"{prefix}_latest.csv",
+        "folds_csv": f"{prefix}_folds.csv",
+        "events_csv": f"{prefix}_events.csv",
+        "features_csv": f"{prefix}_features.csv",
+        "source": "etf_money_flow_daily",
+    }
+    summary_path = destination / f"etf_factor_research_{stamp}.json"
+    summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    typer.echo(json.dumps(summary, ensure_ascii=False, indent=2, default=str))
+    typer.echo(f"summary_json={summary_path}")
 
 
 @app.command("etf-flow-scheduler")
